@@ -105,8 +105,9 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
   q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
-  # Migra o formato antigo (um enlace cortado em dois por CTO) para um enlace lógico único.
-  while True:
+  # A consolidação dos registros antigos é deliberadamente opt-in: ela remove trechos filhos.
+  # Habilite somente depois de criar backup: MIGRATE_LEGACY_SPLIT_LINKS=true.
+  while os.getenv('MIGRATE_LEGACY_SPLIT_LINKS','false').lower()=='true':
    q.execute("""SELECT p.id parent_id,p.target_id node_id,c.id child_id FROM links p JOIN links c ON c.parent_link_id=p.id WHERE p.target_kind='node' AND c.source_kind='node' AND p.target_id=c.source_id LIMIT 1 FOR UPDATE""")
    split=q.fetchone()
    if not split:break
