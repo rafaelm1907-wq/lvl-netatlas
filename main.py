@@ -25,7 +25,7 @@ class Endpoint(BaseModel):
 class LinkIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); source:Endpoint; target:Endpoint; parent_link_id:int|None=None; coordinates:list[list[float]]=Field(min_length=2); route_mode:str=Field(default='manual',pattern='^(manual|straight|suggested)$'); trunk_group:str|None=Field(default=None,max_length=80); is_trunk:bool=False
 class LinkBatchIn(BaseModel): links:list[LinkIn]=Field(min_length=1,max_length=32)
-class LagMemberIn(BaseModel): source:Endpoint; target:Endpoint
+class LagMemberIn(BaseModel): source:Endpoint; target:Endpoint|None=None
 class LinkLagsIn(BaseModel): members:list[LagMemberIn]=Field(min_length=1,max_length=32)
 class LinkGeometry(BaseModel): coordinates:list[list[float]]=Field(min_length=2)
 class LinkNameIn(BaseModel): name:str=Field(min_length=1,max_length=200)
@@ -104,6 +104,17 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
+  q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
+  # Migra o formato antigo (um enlace cortado em dois por CTO) para um enlace lógico único.
+  while True:
+   q.execute("""SELECT p.id parent_id,p.target_id node_id,c.id child_id FROM links p JOIN links c ON c.parent_link_id=p.id WHERE p.target_kind='node' AND c.source_kind='node' AND p.target_id=c.source_id LIMIT 1 FOR UPDATE""")
+   split=q.fetchone()
+   if not split:break
+   q.execute('INSERT INTO link_passive_nodes(link_id,node_id)VALUES(%s,%s) ON CONFLICT DO NOTHING',(split['parent_id'],split['node_id']))
+   q.execute("""UPDATE links p SET target_kind=c.target_kind,target_id=c.target_id,target_name=c.target_name,target_zabbix_hostid=c.target_zabbix_hostid,target_interface_itemid=c.target_interface_itemid,target_interface_name=c.target_interface_name,target_interface_description=c.target_interface_description,geom=ST_MakeLine(p.geom,c.geom),updated_at=now() FROM links c WHERE p.id=%s AND c.id=%s""",(split['parent_id'],split['child_id']))
+   q.execute('UPDATE links SET parent_link_id=%s WHERE parent_link_id=%s',(split['parent_id'],split['child_id']))
+   q.execute("UPDATE issues SET target_kind='link',target_id=%s,target_name=(SELECT name FROM links WHERE id=%s) WHERE target_kind='link' AND target_id=%s",(split['parent_id'],split['parent_id'],split['child_id']))
+   q.execute('DELETE FROM links WHERE id=%s',(split['child_id'],))
   q.execute('SELECT count(*) n FROM users')
   if q.fetchone()['n']==0:
    pwd=os.getenv('NETATLAS_SUPERADMIN_PASSWORD')
@@ -496,6 +507,10 @@ def link_interface_states(host_id):
 @app.get('/api/links')
 def links(u=Depends(viewer)):
  rs=rows();host_ids={int(r[k]) for r in rs for k in ('source_zabbix_hostid','target_zabbix_hostid') if r[k]};interface_cache={}
+ with pg() as c,c.cursor() as q:
+  q.execute("SELECT pn.link_id,n.id,n.name,n.kind,pn.position_fraction FROM link_passive_nodes pn JOIN nodes n ON n.id=pn.node_id ORDER BY pn.link_id,pn.position_fraction,pn.created_at")
+  passive_by_link={}
+  for item in q.fetchall():passive_by_link.setdefault(item['link_id'],[]).append({'id':item['id'],'name':item['name'],'kind':item['kind'],'position_fraction':item['position_fraction']})
  for hid in host_ids:
   try:interface_cache[hid]=link_interface_states(hid)
   except:interface_cache[hid]=[]
@@ -530,13 +545,9 @@ def links(u=Depends(viewer)):
   if values:
    state='down' if 'down' in values else 'up' if all(v=='up' for v in values) else 'unknown'
    for current in component:statuses[current]=state
- # Uma Eth-Trunk continua operacional enquanto ao menos uma LAG membro estiver UP.
- for trunk in (r for r in rs if r.get('is_trunk') and r.get('trunk_group')):
-  members=[statuses[m['id']] for m in rs if m.get('trunk_group')==trunk['trunk_group'] and not m.get('is_trunk')]
-  if members:statuses[trunk['id']]='up' if 'up' in members else 'down' if all(v=='down' for v in members) else 'unknown'
  out=[]
  for r in rs:
-  d=dict(r);d['geometry']=json.loads(d['geometry']);d['status']=statuses[r['id']];d['created_at']=d['created_at'].isoformat();d['updated_at']=d['updated_at'].isoformat();out.append(d)
+  d=dict(r);d['geometry']=json.loads(d['geometry']);d['status']=statuses[r['id']];d['passive_nodes']=passive_by_link.get(r['id'],[]);d['created_at']=d['created_at'].isoformat();d['updated_at']=d['updated_at'].isoformat();out.append(d)
  return out
 def valid(cs):
  if len(cs)<2 or any(len(c)!=2 or not -180<=c[0]<=180 or not -90<=c[1]<=90 for c in cs):raise HTTPException(422,'Geometria inválida')
@@ -563,16 +574,16 @@ def insert_link_lags(lid:int,x:LinkLagsIn,u=Depends(operator)):
   group=link['trunk_group'] or f'eth-{lid}'
   seen=set()
   for member in x.members:
-   s,t=member.source,member.target
-   if s.kind!='device' or t.kind!='device' or s.id!=link['source_id'] or t.id!=link['target_id'] or s.zabbix_hostid!=link['source_zabbix_hostid'] or t.zabbix_hostid!=link['target_zabbix_hostid']:raise HTTPException(422,'As LAGs precisam pertencer aos mesmos dois hosts da Trunk')
-   if not s.interface_name or not t.interface_name or not s.interface_itemid or not t.interface_itemid:raise HTTPException(422,'Selecione as interfaces monitoradas de cada LAG')
-   key=(s.interface_itemid,t.interface_itemid)
+   s=member.source;t=member.target
+   if s.kind!='device' or s.id!=link['source_id'] or s.zabbix_hostid!=link['source_zabbix_hostid']:raise HTTPException(422,'As LAGs precisam pertencer ao host de origem da Trunk')
+   if not s.interface_name or not s.interface_itemid:raise HTTPException(422,'Selecione uma interface monitorada para cada LAG')
+   key=s.interface_itemid
    if key in seen:raise HTTPException(422,'Não repita o mesmo pareamento de LAG')
    seen.add(key)
   q.execute('UPDATE links SET trunk_group=%s,is_trunk=true,updated_at=now() WHERE id=%s',(group,lid))
   ids=[]
   for member in x.members:
-   s,t=member.source,member.target
+   s=member.source;t=member.target or Endpoint(kind=link['target_kind'],id=link['target_id'],name=link['target_name'],zabbix_hostid=link['target_zabbix_hostid'],interface_itemid=link['target_interface_itemid'],interface_name=link['target_interface_name'],interface_description=link['target_interface_description'])
    q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)
    SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,parent_link_id,geom,route_mode,%s,false FROM links WHERE id=%s RETURNING id""",(f"{link['name']} · LAG {s.interface_name} → {t.interface_name}",s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,group,lid));ids.append(q.fetchone()['id'])
   audit(q,u,'insert_trunk_lags','link',lid,link['name'],{'trunk_group':group,'lag_links':ids,'count':len(ids)})
@@ -608,14 +619,13 @@ def insert_cto_in_link(lid:int,x:LinkCtoIn,u=Depends(operator)):
   if not link:raise HTTPException(404,'Enlace não encontrado')
   fraction=float(link['fraction'])
   if fraction<=0.000001 or fraction>=0.999999:raise HTTPException(422,'Escolha um ponto interno do enlace, afastado das extremidades')
-  q.execute('SELECT ST_X(p) longitude,ST_Y(p) latitude,ST_AsGeoJSON(ST_LineSubstring(%s::geometry,0,%s)) first_geom,ST_AsGeoJSON(ST_LineSubstring(%s::geometry,%s,1)) second_geom FROM (SELECT ST_LineInterpolatePoint(%s::geometry,%s) p)s',(link['geom'],fraction,link['geom'],fraction,link['geom'],fraction));split=q.fetchone()
+  q.execute('SELECT ST_X(p) longitude,ST_Y(p) latitude FROM (SELECT ST_LineInterpolatePoint(%s::geometry,%s) p)s',(link['geom'],fraction));split=q.fetchone()
   q.execute("INSERT INTO nodes(name,kind,geom)VALUES(%s,'cto',ST_SetSRID(ST_MakePoint(%s,%s),4326)) RETURNING id",(x.name.strip(),split['longitude'],split['latitude']));nid=q.fetchone()['id'];node={'id':nid,'name':x.name.strip(),'kind':'cto','latitude':split['latitude'],'longitude':split['longitude']}
   try:device=sync_node_to_netbox(node)
   except Exception as e:raise HTTPException(502,f'Não foi possível compartilhar a CTO no NetBox: {e}')
   q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid))
-  q.execute("UPDATE links SET target_kind='node',target_id=%s,target_name=%s,target_zabbix_hostid=NULL,target_interface_itemid=NULL,target_interface_name=NULL,target_interface_description=NULL,geom=ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),updated_at=now() WHERE id=%s",(nid,x.name.strip(),split['first_geom'],lid))
-  q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode)VALUES(%s,'node',%s,%s,NULL,NULL,NULL,NULL,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s)RETURNING id""",(f"{link['name']} · trecho 2",nid,x.name.strip(),link['target_kind'],link['target_id'],link['target_name'],link['target_zabbix_hostid'],link['target_interface_itemid'],link['target_interface_name'],link['target_interface_description'],lid,split['second_geom'],link['route_mode']));second_id=q.fetchone()['id'];audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'second_link_id':second_id,'netbox_device_id':device['id']})
- return {'node_id':nid,'first_link_id':lid,'second_link_id':second_id,'latitude':split['latitude'],'longitude':split['longitude'],'netbox_device_id':device['id']}
+  q.execute('INSERT INTO link_passive_nodes(link_id,node_id,position_fraction)VALUES(%s,%s,%s)',(lid,nid,fraction));audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'netbox_device_id':device['id'],'position_fraction':fraction})
+ return {'node_id':nid,'link_id':lid,'latitude':split['latitude'],'longitude':split['longitude'],'netbox_device_id':device['id']}
 @app.delete('/api/links/{lid}',status_code=204)
 def delete_link(lid:int,u=Depends(superadmin)):
  with pg() as c,c.cursor() as q:
