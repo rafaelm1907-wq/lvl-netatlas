@@ -23,7 +23,7 @@ class PositionIn(BaseModel):
 class Endpoint(BaseModel):
  kind:str=Field(pattern="^(device|node)$"); id:int; name:str; zabbix_hostid:int|None=None; interface_itemid:int|None=None; interface_name:str|None=None; interface_description:str|None=None
 class LinkIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); source:Endpoint; target:Endpoint; parent_link_id:int|None=None; coordinates:list[list[float]]=Field(min_length=2); route_mode:str=Field(default='manual',pattern='^(manual|straight|suggested)$')
+ name:str=Field(min_length=1,max_length=200); source:Endpoint; target:Endpoint; parent_link_id:int|None=None; coordinates:list[list[float]]=Field(min_length=2); route_mode:str=Field(default='manual',pattern='^(manual|straight|suggested)$'); trunk_group:str|None=Field(default=None,max_length=80); is_trunk:bool=False
 class LinkBatchIn(BaseModel): links:list[LinkIn]=Field(min_length=1,max_length=32)
 class LinkGeometry(BaseModel): coordinates:list[list[float]]=Field(min_length=2)
 class LinkNameIn(BaseModel): name:str=Field(min_length=1,max_length=200)
@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
+  q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
   q.execute('SELECT count(*) n FROM users')
   if q.fetchone()['n']==0:
    pwd=os.getenv('NETATLAS_SUPERADMIN_PASSWORD')
@@ -510,6 +511,10 @@ def links(u=Depends(viewer)):
   changed=False
   for r in rs:
    if r['parent_link_id'] and statuses.get(r['parent_link_id'])=='down' and statuses[r['id']]!='down':statuses[r['id']]='down';changed=True
+ # Uma Eth-Trunk continua operacional enquanto ao menos uma LAG membro estiver UP.
+ for trunk in (r for r in rs if r.get('is_trunk') and r.get('trunk_group')):
+  members=[statuses[m['id']] for m in rs if m.get('trunk_group')==trunk['trunk_group'] and not m.get('is_trunk')]
+  if members:statuses[trunk['id']]='up' if 'up' in members else 'down' if all(v=='down' for v in members) else 'unknown'
  out=[]
  for r in rs:
   d=dict(r);d['geometry']=json.loads(d['geometry']);d['status']=statuses[r['id']];d['created_at']=d['created_at'].isoformat();d['updated_at']=d['updated_at'].isoformat();out.append(d)
@@ -520,7 +525,7 @@ def valid(cs):
 def create_link(x:LinkIn,u=Depends(operator)):
  valid(x.coordinates);geo=json.dumps({'type':'LineString','coordinates':x.coordinates});s=x.source;t=x.target
  with pg() as c,c.cursor() as q:
-  q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode));lid=q.fetchone()['id'];audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode});return {'id':lid}
+  q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'trunk':x.is_trunk});return {'id':lid}
 
 @app.post('/api/links/bulk',status_code=201)
 def create_links_bulk(batch:LinkBatchIn,u=Depends(operator)):
@@ -528,7 +533,7 @@ def create_links_bulk(batch:LinkBatchIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
   for x in batch.links:
    valid(x.coordinates);s=x.source;t=x.target;geo=json.dumps({'type':'LineString','coordinates':x.coordinates})
-   q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode));lid=q.fetchone()['id'];ids.append(lid);audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'batch':True})
+   q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];ids.append(lid);audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'batch':True,'trunk_group':x.trunk_group,'is_trunk':x.is_trunk})
  return {'ids':ids,'count':len(ids)}
 @app.put('/api/links/{lid}')
 def update_link(lid:int,x:LinkGeometry,u=Depends(operator)):
