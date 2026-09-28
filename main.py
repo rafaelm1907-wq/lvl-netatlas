@@ -25,6 +25,8 @@ class Endpoint(BaseModel):
 class LinkIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); source:Endpoint; target:Endpoint; parent_link_id:int|None=None; coordinates:list[list[float]]=Field(min_length=2); route_mode:str=Field(default='manual',pattern='^(manual|straight|suggested)$'); trunk_group:str|None=Field(default=None,max_length=80); is_trunk:bool=False
 class LinkBatchIn(BaseModel): links:list[LinkIn]=Field(min_length=1,max_length=32)
+class LagMemberIn(BaseModel): source:Endpoint; target:Endpoint
+class LinkLagsIn(BaseModel): members:list[LagMemberIn]=Field(min_length=1,max_length=32)
 class LinkGeometry(BaseModel): coordinates:list[list[float]]=Field(min_length=2)
 class LinkNameIn(BaseModel): name:str=Field(min_length=1,max_length=200)
 class LinkInterfaceIn(BaseModel):
@@ -535,6 +537,29 @@ def create_links_bulk(batch:LinkBatchIn,u=Depends(operator)):
    valid(x.coordinates);s=x.source;t=x.target;geo=json.dumps({'type':'LineString','coordinates':x.coordinates})
    q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];ids.append(lid);audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'batch':True,'trunk_group':x.trunk_group,'is_trunk':x.is_trunk})
  return {'ids':ids,'count':len(ids)}
+@app.post('/api/links/{lid}/lags',status_code=201)
+def insert_link_lags(lid:int,x:LinkLagsIn,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT * FROM links WHERE id=%s FOR UPDATE',(lid,));link=q.fetchone()
+  if not link:raise HTTPException(404,'Enlace não encontrado')
+  if not link['source_zabbix_hostid'] or not link['target_zabbix_hostid']:raise HTTPException(422,'Os dois extremos do enlace precisam ser hosts ativos do Zabbix')
+  group=link['trunk_group'] or f'eth-{lid}'
+  seen=set()
+  for member in x.members:
+   s,t=member.source,member.target
+   if s.kind!='device' or t.kind!='device' or s.id!=link['source_id'] or t.id!=link['target_id'] or s.zabbix_hostid!=link['source_zabbix_hostid'] or t.zabbix_hostid!=link['target_zabbix_hostid']:raise HTTPException(422,'As LAGs precisam pertencer aos mesmos dois hosts da Trunk')
+   if not s.interface_name or not t.interface_name or not s.interface_itemid or not t.interface_itemid:raise HTTPException(422,'Selecione as interfaces monitoradas de cada LAG')
+   key=(s.interface_itemid,t.interface_itemid)
+   if key in seen:raise HTTPException(422,'Não repita o mesmo pareamento de LAG')
+   seen.add(key)
+  q.execute('UPDATE links SET trunk_group=%s,is_trunk=true,updated_at=now() WHERE id=%s',(group,lid))
+  ids=[]
+  for member in x.members:
+   s,t=member.source,member.target
+   q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)
+   SELECT %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,parent_link_id,geom,route_mode,%s,false FROM links WHERE id=%s RETURNING id""",(f"{link['name']} · LAG {s.interface_name} → {t.interface_name}",s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,group,lid));ids.append(q.fetchone()['id'])
+  audit(q,u,'insert_trunk_lags','link',lid,link['name'],{'trunk_group':group,'lag_links':ids,'count':len(ids)})
+ return {'trunk_link_id':lid,'lag_link_ids':ids,'count':len(ids)}
 @app.put('/api/links/{lid}')
 def update_link(lid:int,x:LinkGeometry,u=Depends(operator)):
  valid(x.coordinates);geo=json.dumps({'type':'LineString','coordinates':x.coordinates})
