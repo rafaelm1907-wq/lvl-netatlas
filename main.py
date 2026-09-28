@@ -13,7 +13,7 @@ NETBOX_URL=os.getenv("NETBOX_URL","").rstrip("/"); NETBOX_TOKEN=os.getenv("NETBO
 OSRM_URL=os.getenv("OSRM_URL","https://router.project-osrm.org").rstrip("/")
 ZHOST=os.getenv("ZABBIX_DB_HOST",""); ZPORT=int(os.getenv("ZABBIX_DB_PORT","3306")); ZNAME=os.getenv("ZABBIX_DB_NAME","zabbix"); ZUSER=os.getenv("ZABBIX_DB_USER",""); ZPASS=os.getenv("ZABBIX_DB_PASSWORD","")
 DB_DSN=os.getenv("NETATLAS_DB_DSN","postgresql://netatlas_app@127.0.0.1/netatlas")
-LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","http://163.245.211.182:10100").rstrip('/')
+LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","https://lvllicencas.lvltech.com.br").rstrip('/')
 LICENSE_PRODUCT=os.getenv("LICENSE_PRODUCT","LVL - NetAtlas")
 
 class NodeIn(BaseModel):
