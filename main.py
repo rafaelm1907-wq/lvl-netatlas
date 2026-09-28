@@ -500,6 +500,7 @@ def links(u=Depends(viewer)):
   try:interface_cache[hid]=link_interface_states(hid)
   except:interface_cache[hid]=[]
  statuses={}
+ endpoint_values={}
  for r in rs:
   endpoint_states=[]
   for side in ('source','target'):
@@ -507,12 +508,28 @@ def links(u=Depends(viewer)):
    if not hid:continue
    candidates=interface_cache.get(int(hid),[]);match=next((x for x in candidates if itemid and x['status_itemid'] and int(x['status_itemid'])==int(itemid)),None) or next((x for x in candidates if x['name']==name),None)
    endpoint_states.append(match['status'] if match else 'unknown')
+  endpoint_values[r['id']]=endpoint_states
   statuses[r['id']]='down' if 'down' in endpoint_states else 'up' if endpoint_states and all(v=='up' for v in endpoint_states) else 'unknown'
- changed=True
- while changed:
-  changed=False
-  for r in rs:
-   if r['parent_link_id'] and statuses.get(r['parent_link_id'])=='down' and statuses[r['id']]!='down':statuses[r['id']]='down';changed=True
+ # CTOs são passivas: todos os trechos conectados por elas usam as interfaces
+ # monitoradas existentes no caminho, sem transformar o estado em "desconhecido".
+ adjacent={r['id']:set() for r in rs};by_passive={}
+ for r in rs:
+  for side in ('source','target'):
+   if r[f'{side}_kind']=='node':by_passive.setdefault(r[f'{side}_id'],set()).add(r['id'])
+  if r['parent_link_id'] in adjacent:adjacent[r['id']].add(r['parent_link_id']);adjacent[r['parent_link_id']].add(r['id'])
+ for link_ids in by_passive.values():
+  for a in link_ids:adjacent[a].update(link_ids-{a})
+ visited=set()
+ for lid in adjacent:
+  if lid in visited:continue
+  stack=[lid];component=[];values=[];visited.add(lid)
+  while stack:
+   current=stack.pop();component.append(current);values.extend(endpoint_values[current])
+   for nxt in adjacent[current]:
+    if nxt not in visited:visited.add(nxt);stack.append(nxt)
+  if values:
+   state='down' if 'down' in values else 'up' if all(v=='up' for v in values) else 'unknown'
+   for current in component:statuses[current]=state
  # Uma Eth-Trunk continua operacional enquanto ao menos uma LAG membro estiver UP.
  for trunk in (r for r in rs if r.get('is_trunk') and r.get('trunk_group')):
   members=[statuses[m['id']] for m in rs if m.get('trunk_group')==trunk['trunk_group'] and not m.get('is_trunk')]
