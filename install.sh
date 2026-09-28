@@ -12,21 +12,26 @@ read -r -s -p 'Senha do usuário Zabbix: ' ZABBIX_DB_PASSWORD; echo
 read -r -s -p 'Senha inicial do Superadmin NetAtlas: ' NETATLAS_SUPERADMIN_PASSWORD; echo
 read -r -p 'URL do servidor de licenças (vazio para configurar depois): ' LICENSE_SERVER_URL
 
-for command in git python3 psql; do command -v "$command" >/dev/null || { echo "Dependência ausente: $command" >&2; exit 1; }; done
+command -v apt-get >/dev/null || { echo 'Este instalador atualmente suporta Ubuntu/Debian (apt).' >&2; exit 1; }
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y git python3 python3-venv postgresql postgresql-contrib postgis
 INSTALL_DIR=/opt/netatlas
 [[ -d "$INSTALL_DIR/.git" ]] && { echo "$INSTALL_DIR já contém uma instalação. Atualize-a pelo Git ou escolha outro servidor." >&2; exit 1; }
+SOURCE_DIR=$(cd "$(dirname "$0")" && pwd)
 
 install -d -m 0750 /etc/netatlas
 DB_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
-sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='netatlas_app') THEN CREATE ROLE netatlas_app LOGIN PASSWORD '${DB_PASSWORD}'; END IF;
 END \$\$;
 CREATE DATABASE netatlas OWNER netatlas_app;
 SQL
-sudo -u postgres psql -d netatlas -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS postgis;'
+runuser -u postgres -- psql -d netatlas -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS postgis;'
 
-git clone "${1:?Uso: sudo ./install.sh URL_DO_REPOSITORIO_GIT}" "$INSTALL_DIR"
+install -d -m 0755 "$INSTALL_DIR"
+cp -a "$SOURCE_DIR/." "$INSTALL_DIR/"
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"

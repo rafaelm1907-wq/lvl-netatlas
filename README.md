@@ -9,9 +9,9 @@ O instalador pede interativamente o endereço e token do NetBox, os dados de ace
 No servidor novo, com PostgreSQL/PostGIS, Git e Python 3 instalados:
 
 ```bash
-git clone URL_DO_REPOSITORIO_GIT
-cd netatlas
-sudo ./install.sh URL_DO_REPOSITORIO_GIT
+git clone https://github.com/rafaelm1907-wq/lvl-netatlas.git
+cd lvl-netatlas
+sudo ./install.sh
 ```
 
 O serviço é criado em `netatlas.service`, escuta na porta `20050` e as credenciais ficam protegidas em `/etc/netatlas/netatlas.env` (`0600`).
