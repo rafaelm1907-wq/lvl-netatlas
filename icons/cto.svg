@@ -1,5 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect x="7" y="9" width="50" height="46" rx="8" fill="#0f2940" stroke="#38bdf8" stroke-width="4"/>
-  <path d="M17 22h30M17 32h30M17 42h30" stroke="#7dd3fc" stroke-width="3" stroke-linecap="round"/>
-  <circle cx="22" cy="22" r="3" fill="#e0f2fe"/><circle cx="32" cy="32" r="3" fill="#e0f2fe"/><circle cx="42" cy="42" r="3" fill="#e0f2fe"/>
+  <defs><linearGradient id="case" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#164e70"/><stop offset="1" stop-color="#082f49"/></linearGradient></defs>
+  <rect x="6" y="8" width="52" height="48" rx="9" fill="url(#case)" stroke="#7dd3fc" stroke-width="3"/>
+  <rect x="11" y="13" width="42" height="8" rx="3" fill="#0c2438" stroke="#38bdf8"/>
+  <path d="M15 31h34M15 43h34" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round"/>
+  <g fill="#e0f2fe" stroke="#0284c7"><circle cx="18" cy="31" r="3"/><circle cx="27" cy="31" r="3"/><circle cx="37" cy="31" r="3"/><circle cx="46" cy="31" r="3"/><circle cx="18" cy="43" r="3"/><circle cx="27" cy="43" r="3"/><circle cx="37" cy="43" r="3"/><circle cx="46" cy="43" r="3"/></g>
+  <circle cx="48" cy="17" r="2" fill="#22c55e"/>
 </svg>

@@ -21,7 +21,7 @@ loadTopology=async function(){let data=await api('/api/topology'),bounds=[],coun
 
 const originalStartMove=startMove,originalBeginLink=beginLink,originalChooseElementAt=chooseElementAt;
 startMove=function(m){if(!canOperate()){hint('Seu perfil permite somente visualizar e reportar erros.');return}originalStartMove(m)};
-beginLink=function(m,x){if(!canOperate()){hint('Seu perfil não permite criar enlaces.');return}originalBeginLink(m,x)};
+beginLink=function(m,x){if(!canOperate()){hint('Seu perfil não permite criar enlaces.');return}return originalBeginLink(m,x)};
 chooseElementAt=function(p){if(!canOperate()){hint('Seu perfil não permite adicionar elementos.');return}originalChooseElementAt(p)};
 const originalAddMarker=addMarker;
 addMarker=function(d,point){let m=originalAddMarker(d,point);if(d.kind==='cto'||d.kind==='device'){m.off('contextmenu');m.on('contextmenu',e=>{L.DomEvent.stopPropagation(e);if(mode)return;let isHost=d.kind==='device',canDelete=canOperate(),label=isHost?'Host':'CTO',p=L.popup().setLatLng(e.latlng).setContent(`<div class="link-menu"><b>${esc(d.name)}</b><button id="moveElement">Mover</button>${canDelete?`<button id="deleteElementHere" class="danger">Excluir ${label}</button>`:''}</div>`).openOn(map);setTimeout(()=>{let move=document.getElementById('moveElement'),remove=document.getElementById('deleteElementHere');if(move)move.onclick=()=>{map.closePopup(p);startMove(m)};if(remove)remove.onclick=()=>{map.closePopup(p);isHost?deleteHostConfirmed(m):deleteCtoConfirmed(m)}},0)})}return m};

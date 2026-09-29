@@ -21,7 +21,7 @@ class NodeIn(BaseModel):
 class PositionIn(BaseModel):
  latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class Endpoint(BaseModel):
- kind:str=Field(pattern="^(device|node)$"); id:int; name:str; zabbix_hostid:int|None=None; interface_itemid:int|None=None; interface_name:str|None=None; interface_description:str|None=None
+ kind:str=Field(pattern="^(device|node)$"); id:int; name:str; zabbix_hostid:int|None=None; interface_itemid:int|None=None; interface_name:str|None=None; interface_description:str|None=None; splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$")
 class LinkIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); source:Endpoint; target:Endpoint; parent_link_id:int|None=None; coordinates:list[list[float]]=Field(min_length=2); route_mode:str=Field(default='manual',pattern='^(manual|straight|suggested)$'); trunk_group:str|None=Field(default=None,max_length=80); is_trunk:bool=False
 class LinkBatchIn(BaseModel): links:list[LinkIn]=Field(min_length=1,max_length=32)
@@ -32,7 +32,7 @@ class LinkNameIn(BaseModel): name:str=Field(min_length=1,max_length=200)
 class LinkInterfaceIn(BaseModel):
  interface_itemid:int|None=None; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None
 class LinkCtoIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
+ name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$")
 class ZabbixHostImportIn(BaseModel):
  hostid:int; latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class ValidateProvisionalHostIn(BaseModel): hostid:int
@@ -103,8 +103,9 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
+  q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
-  q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
+  q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,splitter_type TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));ALTER TABLE link_passive_nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
   # A consolidação dos registros antigos é deliberadamente opt-in: ela remove trechos filhos.
   # Habilite somente depois de criar backup: MIGRATE_LEGACY_SPLIT_LINKS=true.
   while os.getenv('MIGRATE_LEGACY_SPLIT_LINKS','false').lower()=='true':
@@ -509,9 +510,9 @@ def link_interface_states(host_id):
 def links(u=Depends(viewer)):
  rs=rows();host_ids={int(r[k]) for r in rs for k in ('source_zabbix_hostid','target_zabbix_hostid') if r[k]};interface_cache={}
  with pg() as c,c.cursor() as q:
-  q.execute("SELECT pn.link_id,n.id,n.name,n.kind,pn.position_fraction FROM link_passive_nodes pn JOIN nodes n ON n.id=pn.node_id ORDER BY pn.link_id,pn.position_fraction,pn.created_at")
+  q.execute("SELECT pn.link_id,n.id,n.name,n.kind,pn.position_fraction,pn.splitter_type FROM link_passive_nodes pn JOIN nodes n ON n.id=pn.node_id ORDER BY pn.link_id,pn.position_fraction,pn.created_at")
   passive_by_link={}
-  for item in q.fetchall():passive_by_link.setdefault(item['link_id'],[]).append({'id':item['id'],'name':item['name'],'kind':item['kind'],'position_fraction':item['position_fraction']})
+  for item in q.fetchall():passive_by_link.setdefault(item['link_id'],[]).append({'id':item['id'],'name':item['name'],'kind':item['kind'],'position_fraction':item['position_fraction'],'splitter_type':item['splitter_type']})
  for hid in host_ids:
   try:interface_cache[hid]=link_interface_states(hid)
   except:interface_cache[hid]=[]
@@ -556,7 +557,7 @@ def valid(cs):
 def create_link(x:LinkIn,u=Depends(operator)):
  valid(x.coordinates);geo=json.dumps({'type':'LineString','coordinates':x.coordinates});s=x.source;t=x.target
  with pg() as c,c.cursor() as q:
-  q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'trunk':x.is_trunk});return {'id':lid}
+  q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,source_splitter_type,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,target_splitter_type,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,s.splitter_type,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,t.splitter_type,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'trunk':x.is_trunk,'source_splitter':s.splitter_type,'target_splitter':t.splitter_type});return {'id':lid}
 
 @app.post('/api/links/bulk',status_code=201)
 def create_links_bulk(batch:LinkBatchIn,u=Depends(operator)):
@@ -564,7 +565,7 @@ def create_links_bulk(batch:LinkBatchIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
   for x in batch.links:
    valid(x.coordinates);s=x.source;t=x.target;geo=json.dumps({'type':'LineString','coordinates':x.coordinates})
-   q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];ids.append(lid);audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'batch':True,'trunk_group':x.trunk_group,'is_trunk':x.is_trunk})
+   q.execute("""INSERT INTO links(name,source_kind,source_id,source_name,source_zabbix_hostid,source_interface_itemid,source_interface_name,source_interface_description,source_splitter_type,target_kind,target_id,target_name,target_zabbix_hostid,target_interface_itemid,target_interface_name,target_interface_description,target_splitter_type,parent_link_id,geom,route_mode,trunk_group,is_trunk)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,ST_SetSRID(ST_GeomFromGeoJSON(%s),4326),%s,%s,%s)RETURNING id""",(x.name,s.kind,s.id,s.name,s.zabbix_hostid,s.interface_itemid,s.interface_name,s.interface_description,s.splitter_type,t.kind,t.id,t.name,t.zabbix_hostid,t.interface_itemid,t.interface_name,t.interface_description,t.splitter_type,x.parent_link_id,geo,x.route_mode,x.trunk_group,x.is_trunk));lid=q.fetchone()['id'];ids.append(lid);audit(q,u,'create_link','link',lid,x.name,{'source':s.name,'target':t.name,'route_mode':x.route_mode,'batch':True,'trunk_group':x.trunk_group,'is_trunk':x.is_trunk,'source_splitter':s.splitter_type,'target_splitter':t.splitter_type})
  return {'ids':ids,'count':len(ids)}
 @app.post('/api/links/{lid}/lags',status_code=201)
 def insert_link_lags(lid:int,x:LinkLagsIn,u=Depends(operator)):
@@ -625,7 +626,7 @@ def insert_cto_in_link(lid:int,x:LinkCtoIn,u=Depends(operator)):
   try:device=sync_node_to_netbox(node)
   except Exception as e:raise HTTPException(502,f'Não foi possível compartilhar a CTO no NetBox: {e}')
   q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid))
-  q.execute('INSERT INTO link_passive_nodes(link_id,node_id,position_fraction)VALUES(%s,%s,%s)',(lid,nid,fraction));audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'netbox_device_id':device['id'],'position_fraction':fraction})
+  q.execute('INSERT INTO link_passive_nodes(link_id,node_id,position_fraction,splitter_type)VALUES(%s,%s,%s,%s)',(lid,nid,fraction,x.splitter_type));audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'netbox_device_id':device['id'],'position_fraction':fraction,'splitter_type':x.splitter_type})
  return {'node_id':nid,'link_id':lid,'latitude':split['latitude'],'longitude':split['longitude'],'netbox_device_id':device['id']}
 @app.delete('/api/links/{lid}',status_code=204)
 def delete_link(lid:int,u=Depends(superadmin)):
