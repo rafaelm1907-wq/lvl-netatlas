@@ -13,6 +13,8 @@ ExecStart=/opt/netatlas/venv/bin/uvicorn main:app --host 0.0.0.0 --port 20050 --
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 PrivateTmp=true
 
 [Install]
