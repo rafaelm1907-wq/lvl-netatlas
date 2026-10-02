@@ -48,6 +48,8 @@ class LicenseActivateIn(BaseModel):
  license_key:str=Field(min_length=8,max_length=300)
 class BgpFeatureIn(BaseModel):
  enabled:bool; zabbix_hostid:int
+class OperatorInterfaceIn(BaseModel):
+ zabbix_hostid:int; interface_itemid:int; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None; provider_name:str=Field(min_length=1,max_length=120)
 
 def pg(): return psycopg.connect(DB_DSN,row_factory=psycopg.rows.dict_row)
 def zconn(): return pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=5,read_timeout=10,cursorclass=pymysql.cursors.DictCursor)
@@ -105,6 +107,7 @@ CREATE TABLE IF NOT EXISTS issues(id BIGSERIAL PRIMARY KEY,target_kind TEXT NOT 
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL,actor_role TEXT NOT NULL,action TEXT NOT NULL,target_kind TEXT NOT NULL,target_id BIGINT,target_name TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC)""")
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
   q.execute("CREATE TABLE IF NOT EXISTS bgp_devices(device_id BIGINT PRIMARY KEY,zabbix_hostid BIGINT NOT NULL,enabled BOOLEAN NOT NULL DEFAULT true,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+  q.execute("CREATE TABLE IF NOT EXISTS bgp_operator_interfaces(id BIGSERIAL PRIMARY KEY,device_id BIGINT NOT NULL,zabbix_hostid BIGINT NOT NULL,interface_itemid BIGINT NOT NULL,interface_name TEXT NOT NULL,interface_description TEXT,provider_name TEXT NOT NULL,image_data BYTEA,image_content_type TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(device_id,interface_itemid))")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
@@ -321,6 +324,56 @@ def device_bgp_peers(device_id:int,u=Depends(viewer)):
  try:peers=bgp_peers(int(configured['zabbix_hostid']))
  except Exception as e:raise HTTPException(502,f'Falha ao consultar peers BGP no Zabbix: {e}')
  return {'device_id':device_id,'zabbix_hostid':configured['zabbix_hostid'],'peers':peers,'count':len(peers)}
+
+def operator_interfaces_for_device(device_id:int,u):
+ with pg() as c,c.cursor() as q:q.execute('SELECT id,device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name,image_data IS NOT NULL has_image,updated_at FROM bgp_operator_interfaces WHERE device_id=%s ORDER BY provider_name,interface_name',(device_id,));configured=q.fetchall()
+ if not configured:return []
+ live=interfaces(int(configured[0]['zabbix_hostid']),u)
+ for row in configured:
+  match=next((x for x in live if int(x.get('status_itemid') or x.get('rx_itemid') or x.get('tx_itemid') or 0)==int(row['interface_itemid']) or x['name']==row['interface_name']),None)
+  row['metrics']=match;row['image_url']=f"/api/operator-interfaces/{row['id']}/image?v={int(row['updated_at'].timestamp())}" if row['has_image'] else None;row.pop('has_image',None);row['updated_at']=row['updated_at'].isoformat()
+ return configured
+
+@app.get('/api/devices/{device_id}/bgp/operator-interfaces')
+def list_device_operator_interfaces(device_id:int,u=Depends(viewer)):return operator_interfaces_for_device(device_id,u)
+
+@app.put('/api/devices/{device_id}/bgp/operator-interfaces')
+def save_operator_interface(device_id:int,x:OperatorInterfaceIn,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT 1 FROM bgp_devices WHERE device_id=%s AND zabbix_hostid=%s AND enabled',(device_id,x.zabbix_hostid))
+  if not q.fetchone():raise HTTPException(422,'Ative o monitoramento BGP neste host antes de marcar interfaces de operadora')
+  q.execute("INSERT INTO bgp_operator_interfaces(device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name)VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(device_id,interface_itemid)DO UPDATE SET interface_name=excluded.interface_name,interface_description=excluded.interface_description,provider_name=excluded.provider_name,updated_at=now() RETURNING id",(device_id,x.zabbix_hostid,x.interface_itemid,x.interface_name,x.interface_description,x.provider_name.strip()));oid=q.fetchone()['id'];audit(q,u,'mark_operator_interface','device',device_id,x.provider_name.strip(),{'operator_interface_id':oid,'interface_itemid':x.interface_itemid,'interface_name':x.interface_name})
+ return {'id':oid,'provider_name':x.provider_name.strip()}
+
+@app.delete('/api/operator-interfaces/{operator_id}',status_code=204)
+def delete_operator_interface(operator_id:int,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute('DELETE FROM bgp_operator_interfaces WHERE id=%s RETURNING device_id,provider_name,interface_name',(operator_id,));row=q.fetchone()
+  if not row:raise HTTPException(404,'Interface de operadora não encontrada')
+  audit(q,u,'unmark_operator_interface','device',row['device_id'],row['provider_name'],{'operator_interface_id':operator_id,'interface_name':row['interface_name']})
+
+@app.put('/api/operator-interfaces/{operator_id}/image')
+async def upload_operator_image(operator_id:int,request:Request,u=Depends(operator)):
+ content_type=(request.headers.get('content-type') or '').split(';')[0].lower();allowed={'image/png','image/jpeg','image/webp','image/gif'}
+ if content_type not in allowed:raise HTTPException(415,'Envie uma imagem PNG, JPEG, WebP ou GIF')
+ data=await request.body()
+ if not data or len(data)>2*1024*1024:raise HTTPException(413,'A imagem deve possuir no máximo 2 MB')
+ with pg() as c,c.cursor() as q:
+  q.execute('UPDATE bgp_operator_interfaces SET image_data=%s,image_content_type=%s,updated_at=now() WHERE id=%s RETURNING device_id,provider_name',(data,content_type,operator_id));row=q.fetchone()
+  if not row:raise HTTPException(404,'Interface de operadora não encontrada')
+  audit(q,u,'upload_operator_image','device',row['device_id'],row['provider_name'],{'operator_interface_id':operator_id,'content_type':content_type,'bytes':len(data)})
+ return {'status':'ok'}
+
+@app.get('/api/operator-interfaces/{operator_id}/image')
+def operator_image(operator_id:int,u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:q.execute('SELECT image_data,image_content_type FROM bgp_operator_interfaces WHERE id=%s',(operator_id,));row=q.fetchone()
+ if not row or not row['image_data']:raise HTTPException(404,'Imagem não encontrada')
+ return Response(content=bytes(row['image_data']),media_type=row['image_content_type'],headers={'Cache-Control':'private, max-age=3600'})
+
+@app.get('/api/bgp/operator-interfaces')
+def all_operator_interfaces(u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:q.execute('SELECT DISTINCT oi.device_id FROM bgp_operator_interfaces oi JOIN bgp_devices b ON b.device_id=oi.device_id AND b.enabled ORDER BY oi.device_id');device_ids=[int(r['device_id']) for r in q.fetchall()]
+ return [{'device_id':device_id,'interfaces':operator_interfaces_for_device(device_id,u)} for device_id in device_ids]
 
 @app.get('/api/host-statuses')
 def host_statuses(ids:str='',u=Depends(viewer)):
