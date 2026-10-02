@@ -1,4 +1,5 @@
-import hashlib, hmac, json, os, re, secrets, socket, unicodedata
+import hashlib, hmac, ipaddress, json, os, re, secrets, socket, subprocess, unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import httpx, psycopg, pymysql
@@ -45,6 +46,8 @@ class UserIn(BaseModel):
  username:str=Field(min_length=3,max_length=80); display_name:str=Field(min_length=1,max_length=120); password:str=Field(min_length=8,max_length=200); role:str=Field(pattern='^(superadmin|admin|technician)$')
 class LicenseActivateIn(BaseModel):
  license_key:str=Field(min_length=8,max_length=300)
+class BgpFeatureIn(BaseModel):
+ enabled:bool; zabbix_hostid:int
 
 def pg(): return psycopg.connect(DB_DSN,row_factory=psycopg.rows.dict_row)
 def zconn(): return pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=5,read_timeout=10,cursorclass=pymysql.cursors.DictCursor)
@@ -101,6 +104,7 @@ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT N
 CREATE TABLE IF NOT EXISTS issues(id BIGSERIAL PRIMARY KEY,target_kind TEXT NOT NULL CHECK(target_kind IN('device','node','link')),target_id BIGINT NOT NULL,target_name TEXT NOT NULL,severity TEXT NOT NULL CHECK(severity IN('medium','severe','disaster')),description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','validated','resolved')),reported_by BIGINT NOT NULL REFERENCES users(id),validated_by BIGINT REFERENCES users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),validated_at TIMESTAMPTZ,resolved_at TIMESTAMPTZ);CREATE INDEX IF NOT EXISTS issues_target_idx ON issues(target_kind,target_id,status);
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL,actor_role TEXT NOT NULL,action TEXT NOT NULL,target_kind TEXT NOT NULL,target_id BIGINT,target_name TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC)""")
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+  q.execute("CREATE TABLE IF NOT EXISTS bgp_devices(device_id BIGINT PRIMARY KEY,zabbix_hostid BIGINT NOT NULL,enabled BOOLEAN NOT NULL DEFAULT true,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
@@ -181,6 +185,37 @@ def latest_numeric(ids):
  if not ids:return {}
  ph=','.join(['%s']*len(ids));sql=f"""SELECT i.itemid,CASE WHEN i.value_type=0 THEN(SELECT h.value FROM history h WHERE h.itemid=i.itemid ORDER BY h.clock DESC LIMIT 1)WHEN i.value_type=3 THEN(SELECT h.value FROM history_uint h WHERE h.itemid=i.itemid ORDER BY h.clock DESC LIMIT 1)END value,CASE WHEN i.value_type=0 THEN(SELECT h.clock FROM history h WHERE h.itemid=i.itemid ORDER BY h.clock DESC LIMIT 1)WHEN i.value_type=3 THEN(SELECT h.clock FROM history_uint h WHERE h.itemid=i.itemid ORDER BY h.clock DESC LIMIT 1)END clock FROM items i WHERE i.itemid IN({ph})"""
  with closing(zconn()) as c,c.cursor() as q:q.execute(sql,ids);return {int(r['itemid']):{'value':float(r['value']),'clock':int(r['clock'])} for r in q.fetchall() if r['value'] is not None and r['clock'] is not None}
+def ping_peer(address):
+ try:
+  ip=ipaddress.ip_address(address);command=['ping','-n','-c','1','-W','1',str(ip)]
+  if ip.version==6:command.insert(1,'-6')
+  result=subprocess.run(command,capture_output=True,text=True,timeout=3,check=False)
+  match=re.search(r'time[=<]([0-9.]+)\s*ms',result.stdout,re.I)
+  return {'reachable':result.returncode==0,'latency_ms':float(match.group(1)) if match else None}
+ except (ValueError,OSError,subprocess.TimeoutExpired):return {'reachable':False,'latency_ms':None}
+def bgp_peers(host_id):
+ sql="SELECT itemid,name,key_ FROM items WHERE hostid=%s AND status=0 AND flags<>2 AND(key_ LIKE 'BgpPeerState[%%]' OR key_ LIKE 'BgpPeerFsmEstablishedTime[%%]' OR key_ LIKE 'BgpPeerRoutes[%%]')"
+ with closing(zconn()) as c,c.cursor() as q:q.execute(sql,(host_id,));items=q.fetchall()
+ values=latest_details([int(item['itemid']) for item in items]);peers={}
+ for item in items:
+  match=re.match(r'^BgpPeer(State|FsmEstablishedTime|Routes)\[(.+)\]$',item['key_'])
+  if not match:continue
+  metric,address=match.groups()
+  try:address=str(ipaddress.ip_address(address))
+  except ValueError:continue
+  peer=peers.setdefault(address,{'address':address,'asn':None,'state':None,'uptime_seconds':None,'prefixes':None,'collected_at':None})
+  asn=re.search(r'\bAS(\d+)\b',item['name'],re.I)
+  if asn:peer['asn']=int(asn.group(1))
+  sample=values.get(int(item['itemid']))
+  if not sample:continue
+  peer['collected_at']=max(peer['collected_at'] or 0,sample['clock'])
+  if metric=='State':peer['state']=sample['value']
+  elif metric=='FsmEstablishedTime':peer['uptime_seconds']=sample['value']
+  else:peer['prefixes']=sample['value']
+ ordered=sorted(peers.values(),key=lambda p:(ipaddress.ip_address(p['address']).version,int(ipaddress.ip_address(p['address']))))
+ with ThreadPoolExecutor(max_workers=min(12,max(1,len(ordered)))) as pool:results=list(pool.map(lambda peer:ping_peer(peer['address']),ordered))
+ for peer,ping in zip(ordered,results):peer['ping']=ping
+ return ordered
 def zstates(ids):
  if not ids:return {}
  ph=','.join(['%s']*len(ids));sql=f"SELECT h.hostid,h.name,h.status,COALESCE(MAX(i.available),0) availability,GROUP_CONCAT(DISTINCT NULLIF(i.ip,'') ORDER BY i.main DESC SEPARATOR ', ') ips FROM hosts h LEFT JOIN interface i ON i.hostid=h.hostid WHERE h.hostid IN({ph}) GROUP BY h.hostid,h.name,h.status"
@@ -251,7 +286,9 @@ def topology(u=Depends(viewer)):
  try:sites,devices=nbget('/api/dcim/sites/?limit=1000'),nbget('/api/dcim/devices/?limit=1000')
  except Exception as e:raise HTTPException(502,f'Falha ao consultar o NetBox: {e}')
  sm={s['id']:{'id':s['id'],'name':s['name'],'slug':s['slug'],'latitude':float(s['latitude']) if s.get('latitude') is not None else None,'longitude':float(s['longitude']) if s.get('longitude') is not None else None,'devices':[]} for s in sites};staged=[];ids=[]
- with pg() as c,c.cursor() as q:q.execute("SELECT element_id,ST_Y(geom) latitude,ST_X(geom) longitude FROM element_positions WHERE element_kind='device'");positions={int(r['element_id']):r for r in q.fetchall()}
+ with pg() as c,c.cursor() as q:
+  q.execute("SELECT element_id,ST_Y(geom) latitude,ST_X(geom) longitude FROM element_positions WHERE element_kind='device'");positions={int(r['element_id']):r for r in q.fetchall()}
+  q.execute("SELECT device_id FROM bgp_devices WHERE enabled");bgp_enabled={int(r['device_id']) for r in q.fetchall()}
  for d in devices:
   if re.search(r'NetAtlas node ID:\s*\d+',d.get('comments') or ''):continue
   m=re.search(r'Zabbix host ID:\s*(\d+)',d.get('comments') or '');hid=int(m.group(1)) if m else None
@@ -263,8 +300,27 @@ def topology(u=Depends(viewer)):
   sid=(d.get('site') or {}).get('id')
   if sid not in sm:continue
   s=states.get(hid) if hid else None;dt=d.get('device_type') or {}
-  p=positions.get(int(d['id']));sm[sid]['devices'].append({'id':d['id'],'name':d['name'],'role':(d.get('role') or {}).get('name','Equipamento'),'role_slug':(d.get('role') or {}).get('slug','device'),'model':dt.get('model'),'manufacturer':(dt.get('manufacturer') or {}).get('name'),'netbox_status':(d.get('status') or {}).get('value','unknown'),'zabbix_hostid':hid,'zabbix_name':s.get('name') if s else None,'zabbix_status':s.get('status') if s else None,'availability':s.get('availability') if s else None,'ips':s.get('ips') if s else None,'latitude':float(p['latitude']) if p else None,'longitude':float(p['longitude']) if p else None})
+  p=positions.get(int(d['id']));sm[sid]['devices'].append({'id':d['id'],'name':d['name'],'role':(d.get('role') or {}).get('name','Equipamento'),'role_slug':(d.get('role') or {}).get('slug','device'),'model':dt.get('model'),'manufacturer':(dt.get('manufacturer') or {}).get('name'),'netbox_status':(d.get('status') or {}).get('value','unknown'),'zabbix_hostid':hid,'zabbix_name':s.get('name') if s else None,'zabbix_status':s.get('status') if s else None,'availability':s.get('availability') if s else None,'ips':s.get('ips') if s else None,'bgp_enabled':int(d['id']) in bgp_enabled,'latitude':float(p['latitude']) if p else None,'longitude':float(p['longitude']) if p else None})
  return {'sites':[s for s in sm.values() if s['latitude'] is not None],'zabbix_error':err}
+
+@app.patch('/api/devices/{device_id}/bgp')
+def configure_bgp(device_id:int,x:BgpFeatureIn,u=Depends(operator)):
+ try:
+  with closing(zconn()) as c,c.cursor() as z:z.execute('SELECT name FROM hosts WHERE hostid=%s AND status=0',(x.zabbix_hostid,));host=z.fetchone()
+ except Exception as e:raise HTTPException(502,f'Falha ao consultar o host no Zabbix: {e}')
+ if not host:raise HTTPException(404,'Host ativo não encontrado no Zabbix')
+ if 'bgp' not in host['name'].lower():raise HTTPException(422,'A funcionalidade BGP só pode ser ativada em hosts que tenham BGP no nome')
+ with pg() as c,c.cursor() as q:
+  q.execute("INSERT INTO bgp_devices(device_id,zabbix_hostid,enabled)VALUES(%s,%s,%s) ON CONFLICT(device_id)DO UPDATE SET zabbix_hostid=excluded.zabbix_hostid,enabled=excluded.enabled,updated_at=now()",(device_id,x.zabbix_hostid,x.enabled));audit(q,u,'configure_bgp','device',device_id,host['name'],{'enabled':x.enabled,'zabbix_hostid':x.zabbix_hostid})
+ return {'device_id':device_id,'enabled':x.enabled}
+
+@app.get('/api/devices/{device_id}/bgp/peers')
+def device_bgp_peers(device_id:int,u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:q.execute('SELECT zabbix_hostid FROM bgp_devices WHERE device_id=%s AND enabled',(device_id,));configured=q.fetchone()
+ if not configured:raise HTTPException(404,'A funcionalidade BGP não está ativada neste host')
+ try:peers=bgp_peers(int(configured['zabbix_hostid']))
+ except Exception as e:raise HTTPException(502,f'Falha ao consultar peers BGP no Zabbix: {e}')
+ return {'device_id':device_id,'zabbix_hostid':configured['zabbix_hostid'],'peers':peers,'count':len(peers)}
 
 @app.get('/api/host-statuses')
 def host_statuses(ids:str='',u=Depends(viewer)):
