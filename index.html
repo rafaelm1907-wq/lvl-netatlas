@@ -45,6 +45,6 @@ function openLinkPanel(l,layer){showPanel(`<h2>${esc(l.name)}</h2><div class="pa
 async function loadLinks(){links=await api('/api/links');editable.clearLayers();links.forEach(l=>{let layer=L.polyline(l.geometry.coordinates.map(p=>[p[1],p[0]]),{color:lineColor(l.status),weight:5});layer.linkId=l.id;layer.on('click',e=>{L.DomEvent.stopPropagation(e);openLinkPanel(l,layer)});editable.addLayer(layer)})}
 map.on(L.Draw.Event.EDITED,e=>e.layers.eachLayer(l=>api(`/api/links/${l.linkId}`,{method:'PUT',body:JSON.stringify({coordinates:l.getLatLngs().map(p=>[p.lng,p.lat])})}).catch(x=>alert(x.message))));map.on(L.Draw.Event.DELETED,e=>e.layers.eachLayer(l=>api(`/api/links/${l.linkId}`,{method:'DELETE'}).catch(x=>alert(x.message))));
 let legend=L.control({position:'bottomright'});legend.onAdd=()=>{let d=L.DomUtil.create('div','legend');d.innerHTML='<span class="line-swatch" style="border-color:#22c55e"></span>Ativo<br><span class="line-swatch" style="border-color:#ef4444"></span>Inativo/herdado<br><span class="line-swatch" style="border-color:#f59e0b"></span>Sem status';return d};legend.addTo(map);
-</script><script src="/static/workflows.js?v=20261002c"></script><script src="/static/portal.js?v=20261002e"></script><script>
+</script><script src="/static/workflows.js?v=20261002c"></script><script src="/static/portal.js?v=20261002f"></script><script>
 startNetAtlas().catch(e=>{document.getElementById('summary').textContent='Erro';hint(e.message)});
 </script></body></html>
