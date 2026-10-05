@@ -38,6 +38,8 @@ class LinkCtoIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$")
 class ZabbixHostImportIn(BaseModel):
  hostid:int; site_id:int
+class ZabbixHostsImportIn(BaseModel):
+ hostids:list[int]=Field(min_length=1,max_length=100); site_id:int
 class ValidateProvisionalHostIn(BaseModel): hostid:int
 class RouteSuggestionIn(BaseModel):
  source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
@@ -415,10 +417,24 @@ def search_zabbix_hosts(q:str='',u=Depends(operator)):
  term=q.strip()
  if len(term)<2:return []
  like=f'%{term}%'
- sql="""SELECT h.hostid,h.host,h.name,h.status,COALESCE(MAX(i.available),0) availability,GROUP_CONCAT(DISTINCT NULLIF(i.ip,'') ORDER BY i.main DESC SEPARATOR ', ') ips FROM hosts h LEFT JOIN interface i ON i.hostid=h.hostid WHERE h.flags IN(0,4) AND (h.name LIKE %s OR h.host LIKE %s OR i.ip LIKE %s) GROUP BY h.hostid,h.host,h.name,h.status ORDER BY h.name LIMIT 30"""
+ sql="""SELECT h.hostid,h.host,h.name,h.status,COALESCE(MAX(i.available),0) availability,GROUP_CONCAT(DISTINCT NULLIF(i.ip,'') ORDER BY i.main DESC SEPARATOR ', ') ips FROM hosts h LEFT JOIN interface i ON i.hostid=h.hostid WHERE h.flags=0 AND h.status IN(0,1) AND (h.name LIKE %s OR h.host LIKE %s OR i.ip LIKE %s) GROUP BY h.hostid,h.host,h.name,h.status ORDER BY h.name LIMIT 30"""
  try:
   with closing(zconn()) as c,c.cursor() as z:z.execute(sql,(like,like,like));return z.fetchall()
  except Exception as e:raise HTTPException(502,f'Falha ao pesquisar hosts no Zabbix: {e}')
+
+@app.get('/api/zabbix/hosts')
+def list_zabbix_hosts(u=Depends(operator)):
+ sql="""SELECT h.hostid,h.host,h.name,h.status,COALESCE(MAX(i.available),0) availability,GROUP_CONCAT(DISTINCT NULLIF(i.ip,'') ORDER BY i.main DESC SEPARATOR ', ') ips FROM hosts h LEFT JOIN interface i ON i.hostid=h.hostid WHERE h.flags=0 AND h.status IN(0,1) GROUP BY h.hostid,h.host,h.name,h.status ORDER BY h.status,h.name"""
+ try:
+  with closing(zconn()) as c,c.cursor() as z:z.execute(sql);hosts=z.fetchall()
+  imported={}
+  for device in nbget('/api/dcim/devices/?limit=1000'):
+   match=re.search(r'Zabbix host ID:\s*(\d+)',device.get('comments') or '')
+   if match:imported[int(match.group(1))]={'id':device['id'],'name':device['name'],'site':(device.get('site') or {}).get('name')}
+  for host in hosts:
+   device=imported.get(int(host['hostid']));host['imported']=bool(device);host['netbox_device']=device
+  return hosts
+ except Exception as e:raise HTTPException(502,f'Falha ao listar hosts do Zabbix: {e}')
 
 @app.get('/api/zabbix/hosts/{host_id}')
 def preview_zabbix_host(host_id:int,u=Depends(operator)):
@@ -432,17 +448,30 @@ def preview_zabbix_host(host_id:int,u=Depends(operator)):
 
 @app.post('/api/zabbix/hosts/import',status_code=201)
 def import_zabbix_host(x:ZabbixHostImportIn,u=Depends(operator)):
+ return import_zabbix_host_record(x.hostid,x.site_id,u)
+
+def import_zabbix_host_record(hostid,site_id,u):
  try:
-  with closing(zconn()) as c,c.cursor() as z:z.execute('SELECT hostid,host,name,status FROM hosts WHERE hostid=%s',(x.hostid,));host=z.fetchone()
+  with closing(zconn()) as c,c.cursor() as z:z.execute('SELECT hostid,host,name,status FROM hosts WHERE hostid=%s',(hostid,));host=z.fetchone()
   if not host:raise HTTPException(404,'Host não encontrado no Zabbix')
   if int(host['status'])!=0:raise HTTPException(422,'Somente hosts ativos no Zabbix podem consumir uma licença')
   license_active_host('claim',host['hostid'],host['name'])
-  ifaces=interfaces(x.hostid,u)
-  device,site=sync_zabbix_host_to_netbox(host,ifaces,x.site_id);latitude=float(site['latitude']);longitude=float(site['longitude'])
-  with pg() as c,c.cursor() as q:q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(device['id'],longitude,latitude));audit(q,u,'import_zabbix_host','device',device['id'],host['name'],{'zabbix_hostid':x.hostid,'interfaces_synced':len(ifaces),'site_id':x.site_id,'latitude':latitude,'longitude':longitude})
-  return {'device_id':device['id'],'name':host['name'],'hostid':x.hostid,'site':site['name'],'interfaces_synced':len(ifaces)}
+  ifaces=interfaces(hostid,u)
+  device,site=sync_zabbix_host_to_netbox(host,ifaces,site_id);latitude=float(site['latitude']);longitude=float(site['longitude'])
+  with pg() as c,c.cursor() as q:q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(device['id'],longitude,latitude));audit(q,u,'import_zabbix_host','device',device['id'],host['name'],{'zabbix_hostid':hostid,'interfaces_synced':len(ifaces),'site_id':site_id,'latitude':latitude,'longitude':longitude})
+  return {'device_id':device['id'],'name':host['name'],'hostid':hostid,'site':site['name'],'interfaces_synced':len(ifaces)}
  except HTTPException:raise
  except Exception as e:raise HTTPException(502,f'Não foi possível importar o host para o NetBox: {e}')
+
+@app.post('/api/zabbix/hosts/import-bulk',status_code=201)
+def import_zabbix_hosts_bulk(x:ZabbixHostsImportIn,u=Depends(operator)):
+ imported=[];errors=[]
+ for hostid in dict.fromkeys(x.hostids):
+  try:imported.append(import_zabbix_host_record(hostid,x.site_id,u))
+  except HTTPException as error:
+   detail=error.detail if isinstance(error.detail,str) else json.dumps(error.detail,ensure_ascii=False)
+   errors.append({'hostid':hostid,'error':detail})
+ return {'imported':imported,'errors':errors,'requested':len(dict.fromkeys(x.hostids))}
 
 @app.post('/api/nodes/{node_id}/validate-zabbix-host')
 def validate_provisional_host(node_id:int,x:ValidateProvisionalHostIn,u=Depends(operator)):
