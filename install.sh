@@ -21,7 +21,7 @@ INSTALL_DIR=/opt/netatlas
 SOURCE_DIR=$(cd "$(dirname "$0")" && pwd)
 
 install -d -m 0750 /etc/netatlas
-DB_PASSWORD=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+DB_PASSWORD=$(openssl rand -hex 24)
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='netatlas_app') THEN CREATE ROLE netatlas_app LOGIN PASSWORD '${DB_PASSWORD}'; END IF;
@@ -32,6 +32,9 @@ runuser -u postgres -- psql -d netatlas -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION 
 
 install -d -m 0755 "$INSTALL_DIR"
 cp -a "$SOURCE_DIR/." "$INSTALL_DIR/"
+install -d -m 0755 "$INSTALL_DIR/static/icons"
+install -m 0644 "$INSTALL_DIR/index.html" "$INSTALL_DIR/portal.js" "$INSTALL_DIR/workflows.js" "$INSTALL_DIR/static/"
+cp -a "$INSTALL_DIR/icons/." "$INSTALL_DIR/static/icons/"
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
