@@ -26,7 +26,7 @@ runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='netatlas_app') THEN CREATE ROLE netatlas_app LOGIN PASSWORD '${DB_PASSWORD}'; END IF;
 END \$\$;
-CREATE DATABASE netatlas OWNER netatlas_app;
+CREATE DATABASE netatlas OWNER netatlas_app ENCODING 'UTF8' LC_COLLATE='C' LC_CTYPE='C' TEMPLATE template0;
 SQL
 runuser -u postgres -- psql -d netatlas -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS postgis;'
 
