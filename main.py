@@ -1,4 +1,4 @@
-import hashlib, hmac, ipaddress, json, math, os, re, secrets, socket, subprocess, unicodedata
+import hashlib, hmac, ipaddress, json, math, os, re, secrets, socket, subprocess, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -56,7 +56,19 @@ class OperatorInterfaceIn(BaseModel):
  zabbix_hostid:int; interface_itemid:int; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None; provider_name:str=Field(min_length=1,max_length=120); address_family:str=Field(pattern='^(ipv4|ipv6|dual)$')
 
 def pg(): return psycopg.connect(DB_DSN,row_factory=psycopg.rows.dict_row)
-def zconn(): return pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=5,read_timeout=ZREAD_TIMEOUT,cursorclass=pymysql.cursors.DictCursor)
+def zconn():
+ last_error=None
+ for attempt in range(4):
+  try:
+   connection=pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=4,read_timeout=min(10,ZREAD_TIMEOUT),write_timeout=10,cursorclass=pymysql.cursors.DictCursor)
+   connection._read_timeout=ZREAD_TIMEOUT
+   if connection._sock:connection._sock.settimeout(ZREAD_TIMEOUT)
+   return connection
+  except pymysql.err.OperationalError as error:
+   last_error=error
+   if not error.args or error.args[0] not in (2003,2013) or attempt==3:raise
+   time.sleep(.25*(attempt+1))
+ raise last_error
 def password_hash(password,salt=None):
  salt=salt or secrets.token_bytes(16);digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,310000);return salt.hex(),digest.hex()
 def verify_password(password,salt,digest):return hmac.compare_digest(password_hash(password,bytes.fromhex(salt))[1],digest)
