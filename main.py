@@ -297,9 +297,13 @@ def recheck_license(u=Depends(superadmin)):
 def health():return {'status':'ok','service':'LVL - NetAtlas'}
 @app.get('/api/pops')
 def pops(u=Depends(viewer)):
- try:sites=nbget('/api/dcim/sites/?limit=1000')
+ try:sites,devices=nbget('/api/dcim/sites/?limit=1000'),nbget('/api/dcim/devices/?limit=1000')
  except Exception as e:raise HTTPException(502,f'Falha ao consultar os POPs no NetBox: {e}')
- return [{'id':s['id'],'name':s['name'],'slug':s['slug'],'latitude':float(s['latitude']),'longitude':float(s['longitude'])} for s in sites if s.get('latitude') is not None and s.get('longitude') is not None]
+ counts={}
+ for device in devices:
+  site_id=(device.get('site') or {}).get('id')
+  if site_id:counts[site_id]=counts.get(site_id,0)+1
+ return [{'id':s['id'],'name':s['name'],'slug':s['slug'],'latitude':float(s['latitude']),'longitude':float(s['longitude']),'device_count':counts.get(s['id'],0)} for s in sites if s.get('latitude') is not None and s.get('longitude') is not None]
 @app.post('/api/pops',status_code=201)
 def create_pop(x:PopIn,u=Depends(operator)):
  base=slugify(x.name) or 'pop';slug=base
@@ -311,6 +315,35 @@ def create_pop(x:PopIn,u=Depends(operator)):
  except Exception as e:raise HTTPException(502,f'Não foi possível criar o POP no NetBox: {e}')
  with pg() as c,c.cursor() as q:audit(q,u,'create_pop','site',site['id'],site['name'],{'latitude':x.latitude,'longitude':x.longitude})
  return {'id':site['id'],'name':site['name'],'slug':site['slug'],'latitude':float(site['latitude']),'longitude':float(site['longitude'])}
+
+@app.delete('/api/pops/{site_id}')
+def delete_pop(site_id:int,u=Depends(operator)):
+ try:
+  site=nbrequest('GET',f'/api/dcim/sites/{site_id}/')
+  devices=nbget(f'/api/dcim/devices/?site_id={site_id}&limit=1000')
+  if devices:
+   names=', '.join(d['name'] for d in devices[:5]);extra=f' e mais {len(devices)-5}' if len(devices)>5 else ''
+   raise HTTPException(409,f'O POP possui {len(devices)} elemento(s) vinculado(s): {names}{extra}. Exclua ou mova esses elementos primeiro.')
+  nbrequest('DELETE',f'/api/dcim/sites/{site_id}/')
+ except HTTPException:raise
+ except httpx.HTTPStatusError as e:
+  if e.response.status_code==404:raise HTTPException(404,'POP não encontrado no NetBox')
+  raise HTTPException(502,f'Não foi possível excluir o POP no NetBox: {e.response.text[:500]}')
+ except Exception as e:raise HTTPException(502,f'Não foi possível excluir o POP no NetBox: {e}')
+ with pg() as c,c.cursor() as q:audit(q,u,'delete_pop','site',site_id,site['name'],{})
+ return {'status':'ok','id':site_id,'name':site['name']}
+
+@app.get('/api/inventory/hosts')
+def inventory_hosts(u=Depends(operator)):
+ try:devices=nbget('/api/dcim/devices/?limit=1000')
+ except Exception as e:raise HTTPException(502,f'Falha ao consultar os hosts no NetBox: {e}')
+ result=[]
+ for device in devices:
+  comments=device.get('comments') or ''
+  if re.search(r'NetAtlas node ID:\s*\d+',comments):continue
+  match=re.search(r'Zabbix host ID:\s*(\d+)',comments)
+  result.append({'id':device['id'],'name':device['name'],'site':(device.get('site') or {}).get('name'),'site_id':(device.get('site') or {}).get('id'),'status':(device.get('status') or {}).get('value','unknown'),'zabbix_hostid':int(match.group(1)) if match else None})
+ return sorted(result,key=lambda d:((d.get('site') or '').lower(),d['name'].lower()))
 @app.get('/api/topology')
 def topology(u=Depends(viewer)):
  try:sites,devices=nbget('/api/dcim/sites/?limit=1000'),nbget('/api/dcim/devices/?limit=1000')
