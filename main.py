@@ -1,4 +1,4 @@
-import hashlib, hmac, ipaddress, json, os, re, secrets, socket, subprocess, unicodedata
+import hashlib, hmac, ipaddress, json, math, os, re, secrets, socket, subprocess, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -18,7 +18,9 @@ LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","https://lvllicencas.lvltech.c
 LICENSE_PRODUCT=os.getenv("LICENSE_PRODUCT","LVL - NetAtlas")
 
 class NodeIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
+ name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None
+class PopIn(BaseModel):
+ name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class PositionIn(BaseModel):
  latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class Endpoint(BaseModel):
@@ -35,7 +37,7 @@ class LinkInterfaceIn(BaseModel):
 class LinkCtoIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$")
 class ZabbixHostImportIn(BaseModel):
- hostid:int; latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
+ hostid:int; site_id:int
 class ValidateProvisionalHostIn(BaseModel): hostid:int
 class RouteSuggestionIn(BaseModel):
  source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
@@ -146,26 +148,32 @@ def slugify(value):
  value=unicodedata.normalize('NFKD',value).encode('ascii','ignore').decode().lower();return re.sub(r'[^a-z0-9]+','-',value).strip('-')[:100]
 def nbensure(path,slug,payload):
  found=nbget(f'{path}?slug={slug}&limit=1');return found[0] if found else nbrequest('POST',path,payload)
-def sync_node_to_netbox(node):
+def netbox_site(site_id):
+ try:site=nbrequest('GET',f'/api/dcim/sites/{int(site_id)}/')
+ except httpx.HTTPStatusError as e:
+  if e.response.status_code==404:raise RuntimeError('POP não encontrado no NetBox')
+  raise
+ if site.get('latitude') is None or site.get('longitude') is None:raise RuntimeError('O POP selecionado não possui coordenadas')
+ return site
+def sync_node_to_netbox(node,site_id=None):
  labels={'cto':('CTO','cto','CTO'),'host':('Host planejado','host-planejado','Host Planejado'),'junction':('Elemento de rede','elemento-rede','Elemento de Rede'),'cloud':('Operadora','operadora','Operadora / Nuvem')};role_name,role_slug,model=labels.get(node['kind'],labels['junction'])
  manufacturer=nbensure('/api/dcim/manufacturers/','netatlas',{'name':'NetAtlas','slug':'netatlas','description':'Elementos cadastrados e sincronizados pelo LVL - NetAtlas'})
  role=nbensure('/api/dcim/device-roles/',role_slug,{'name':role_name,'slug':role_slug,'color':'2196f3','vm_role':False,'description':'Gerenciado pelo LVL - NetAtlas'})
  dtype_slug=f'netatlas-{role_slug}';dtype=nbensure('/api/dcim/device-types/',dtype_slug,{'manufacturer':manufacturer['id'],'model':model,'slug':dtype_slug,'u_height':0,'is_full_depth':False})
  sites=[s for s in nbget('/api/dcim/sites/?limit=1000') if s.get('latitude') is not None and s.get('longitude') is not None]
- if not sites:raise RuntimeError('Nenhum site com coordenadas disponível no NetBox')
- site=min(sites,key=lambda s:(float(s['latitude'])-float(node['latitude']))**2+(float(s['longitude'])-float(node['longitude']))**2)
+ if site_id is not None:site=netbox_site(site_id)
+ elif not sites:raise RuntimeError('Nenhum POP com coordenadas disponível no NetBox')
+ else:site=min(sites,key=lambda s:(float(s['latitude'])-float(node['latitude']))**2+(float(s['longitude'])-float(node['longitude']))**2)
  marker=f"NetAtlas node ID: {node['id']}";found=nbget(f"/api/dcim/devices/?name={node['name']}&site_id={site['id']}&limit=10")
  for device in found:
   if marker in (device.get('comments') or ''):return device
  payload={'name':node['name'],'device_type':dtype['id'],'role':role['id'],'site':site['id'],'status':'planned' if node['kind']=='host' else 'active','latitude':round(float(node['latitude']),6),'longitude':round(float(node['longitude']),6),'description':f'{role_name} cadastrada pelo LVL - NetAtlas','comments':f"{marker}\nTipo: {node['kind']}"}
  return nbrequest('POST','/api/dcim/devices/',payload)
-def sync_zabbix_host_to_netbox(host,ifaces,latitude,longitude):
+def sync_zabbix_host_to_netbox(host,ifaces,site_id):
  manufacturer=nbensure('/api/dcim/manufacturers/','zabbix-import',{'name':'Zabbix Import','slug':'zabbix-import','description':'Inventário importado pelo LVL - NetAtlas a partir do Zabbix'})
  role=nbensure('/api/dcim/device-roles/','zabbix-host',{'name':'Host Zabbix','slug':'zabbix-host','color':'22c55e','vm_role':False,'description':'Equipamento monitorado pelo Zabbix e gerenciado no NetAtlas'})
  dtype=nbensure('/api/dcim/device-types/','zabbix-managed-host',{'manufacturer':manufacturer['id'],'model':'Host monitorado pelo Zabbix','slug':'zabbix-managed-host','u_height':0,'is_full_depth':False})
- sites=[s for s in nbget('/api/dcim/sites/?limit=1000') if s.get('latitude') is not None and s.get('longitude') is not None]
- if not sites:raise RuntimeError('Nenhum site com coordenadas disponível no NetBox')
- site=min(sites,key=lambda s:(float(s['latitude'])-latitude)**2+(float(s['longitude'])-longitude)**2);marker=f"Zabbix host ID: {host['hostid']}"
+ site=netbox_site(site_id);latitude=float(site['latitude']);longitude=float(site['longitude']);marker=f"Zabbix host ID: {host['hostid']}"
  existing=nbget('/api/dcim/devices/?limit=1000')
  device=next((d for d in existing if marker in (d.get('comments') or '')),None)
  payload={'name':host['name'],'device_type':dtype['id'],'role':role['id'],'site':site['id'],'status':'active','latitude':round(latitude,6),'longitude':round(longitude,6),'description':f"Importado do Zabbix ({host.get('host') or host['name']})",'comments':f"{marker}\nSincronizado pelo LVL - NetAtlas"}
@@ -285,6 +293,22 @@ def recheck_license(u=Depends(superadmin)):
 
 @app.get('/health')
 def health():return {'status':'ok','service':'LVL - NetAtlas'}
+@app.get('/api/pops')
+def pops(u=Depends(viewer)):
+ try:sites=nbget('/api/dcim/sites/?limit=1000')
+ except Exception as e:raise HTTPException(502,f'Falha ao consultar os POPs no NetBox: {e}')
+ return [{'id':s['id'],'name':s['name'],'slug':s['slug'],'latitude':float(s['latitude']),'longitude':float(s['longitude'])} for s in sites if s.get('latitude') is not None and s.get('longitude') is not None]
+@app.post('/api/pops',status_code=201)
+def create_pop(x:PopIn,u=Depends(operator)):
+ base=slugify(x.name) or 'pop';slug=base
+ try:
+  existing=nbget(f'/api/dcim/sites/?slug={slug}&limit=1')
+  if existing:raise HTTPException(409,'Já existe um POP com este nome')
+  site=nbrequest('POST','/api/dcim/sites/',{'name':x.name.strip(),'slug':slug,'status':'active','latitude':round(x.latitude,6),'longitude':round(x.longitude,6),'description':'POP cadastrado pelo LVL - NetAtlas'})
+ except HTTPException:raise
+ except Exception as e:raise HTTPException(502,f'Não foi possível criar o POP no NetBox: {e}')
+ with pg() as c,c.cursor() as q:audit(q,u,'create_pop','site',site['id'],site['name'],{'latitude':x.latitude,'longitude':x.longitude})
+ return {'id':site['id'],'name':site['name'],'slug':site['slug'],'latitude':float(site['latitude']),'longitude':float(site['longitude'])}
 @app.get('/api/topology')
 def topology(u=Depends(viewer)):
  try:sites,devices=nbget('/api/dcim/sites/?limit=1000'),nbget('/api/dcim/devices/?limit=1000')
@@ -414,8 +438,8 @@ def import_zabbix_host(x:ZabbixHostImportIn,u=Depends(operator)):
   if int(host['status'])!=0:raise HTTPException(422,'Somente hosts ativos no Zabbix podem consumir uma licença')
   license_active_host('claim',host['hostid'],host['name'])
   ifaces=interfaces(x.hostid,u)
-  device,site=sync_zabbix_host_to_netbox(host,ifaces,x.latitude,x.longitude)
-  with pg() as c,c.cursor() as q:q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(device['id'],x.longitude,x.latitude));audit(q,u,'import_zabbix_host','device',device['id'],host['name'],{'zabbix_hostid':x.hostid,'interfaces_synced':len(ifaces),'latitude':x.latitude,'longitude':x.longitude})
+  device,site=sync_zabbix_host_to_netbox(host,ifaces,x.site_id);latitude=float(site['latitude']);longitude=float(site['longitude'])
+  with pg() as c,c.cursor() as q:q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(device['id'],longitude,latitude));audit(q,u,'import_zabbix_host','device',device['id'],host['name'],{'zabbix_hostid':x.hostid,'interfaces_synced':len(ifaces),'site_id':x.site_id,'latitude':latitude,'longitude':longitude})
   return {'device_id':device['id'],'name':host['name'],'hostid':x.hostid,'site':site['name'],'interfaces_synced':len(ifaces)}
  except HTTPException:raise
  except Exception as e:raise HTTPException(502,f'Não foi possível importar o host para o NetBox: {e}')
@@ -431,7 +455,10 @@ def validate_provisional_host(node_id:int,x:ValidateProvisionalHostIn,u=Depends(
    if not host:raise HTTPException(404,'Host não encontrado no Zabbix')
    if int(host['status'])!=0:raise HTTPException(422,'Somente hosts ativos no Zabbix podem consumir uma licença')
    license_active_host('claim',host['hostid'],host['name'])
-   ifaces=interfaces(x.hostid,u);device,site=sync_zabbix_host_to_netbox(host,ifaces,float(node['latitude']),float(node['longitude']))
+   if not node['netbox_device_id']:raise HTTPException(422,'O host provisório não está associado a um POP no NetBox')
+   provisional=nbrequest('GET',f"/api/dcim/devices/{node['netbox_device_id']}/");site_id=(provisional.get('site') or {}).get('id')
+   if not site_id:raise HTTPException(422,'O host provisório não está associado a um POP')
+   ifaces=interfaces(x.hostid,u);device,site=sync_zabbix_host_to_netbox(host,ifaces,site_id)
   except HTTPException:raise
   except Exception as e:raise HTTPException(502,f'Não foi possível validar o host no NetBox/Zabbix: {e}')
   old_device_id=node['netbox_device_id']
@@ -520,10 +547,15 @@ def nodes(u=Depends(viewer)):
 @app.post('/api/nodes',status_code=201)
 def create_node(n:NodeIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
-  q.execute('INSERT INTO nodes(name,kind,geom)VALUES(%s,%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) RETURNING id',(n.name,n.kind,n.longitude,n.latitude));nid=q.fetchone()['id'];node={'id':nid,'name':n.name,'kind':n.kind,'latitude':n.latitude,'longitude':n.longitude}
-  try:device=sync_node_to_netbox(node)
+  if n.kind=='host' and n.site_id is None:raise HTTPException(422,'Selecione o POP deste host')
+  latitude,longitude=n.latitude,n.longitude
+  if n.kind=='host':
+   try:site=netbox_site(n.site_id);latitude=float(site['latitude']);longitude=float(site['longitude'])
+   except Exception as e:raise HTTPException(502,f'Não foi possível consultar o POP no NetBox: {e}')
+  q.execute('INSERT INTO nodes(name,kind,geom)VALUES(%s,%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) RETURNING id',(n.name,n.kind,longitude,latitude));nid=q.fetchone()['id'];node={'id':nid,'name':n.name,'kind':n.kind,'latitude':latitude,'longitude':longitude}
+  try:device=sync_node_to_netbox(node,n.site_id)
   except Exception as e:raise HTTPException(502,f'Não foi possível compartilhar o registro no NetBox: {e}')
-  q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid));audit(q,u,'create_node','node',nid,n.name,{'kind':n.kind,'latitude':n.latitude,'longitude':n.longitude,'netbox_device_id':device['id']});return {'id':nid,'netbox_device_id':device['id'],'netbox_site':(device.get('site') or {}).get('name')}
+  q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid));audit(q,u,'create_node','node',nid,n.name,{'kind':n.kind,'site_id':n.site_id,'latitude':latitude,'longitude':longitude,'netbox_device_id':device['id']});return {'id':nid,'netbox_device_id':device['id'],'netbox_site':(device.get('site') or {}).get('name')}
 
 @app.delete('/api/nodes/{node_id}')
 def delete_node(node_id:int,u=Depends(operator)):
@@ -587,7 +619,13 @@ def move_element(kind:str,element_id:int,p:PositionIn,u=Depends(operator)):
     try:nbrequest('PATCH',f"/api/dcim/devices/{node['netbox_device_id']}/",{'latitude':round(p.latitude,6),'longitude':round(p.longitude,6)})
     except Exception as e:raise HTTPException(502,f'Não foi possível atualizar as coordenadas no NetBox: {e}')
    q.execute('UPDATE nodes SET geom=ST_SetSRID(ST_MakePoint(%s,%s),4326),updated_at=now() WHERE id=%s',(*point,element_id))
-  else:q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(element_id,*point))
+  else:
+   try:device=nbrequest('GET',f'/api/dcim/devices/{element_id}/');site=netbox_site((device.get('site') or {}).get('id'))
+   except Exception as e:raise HTTPException(502,f'Não foi possível consultar o POP do host: {e}')
+   lat1,lon1=math.radians(float(site['latitude'])),math.radians(float(site['longitude']));lat2,lon2=math.radians(p.latitude),math.radians(p.longitude)
+   distance=6371000*2*math.asin(math.sqrt(math.sin((lat2-lat1)/2)**2+math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2))
+   if distance>50:raise HTTPException(422,f'O host deve permanecer a até 50 metros do POP {site["name"]}. O deslocamento solicitado foi de {distance:.0f} m.')
+   q.execute("INSERT INTO element_positions(element_kind,element_id,geom)VALUES('device',%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) ON CONFLICT(element_kind,element_id)DO UPDATE SET geom=excluded.geom,updated_at=now()",(element_id,*point))
   q.execute("UPDATE links SET geom=ST_SetPoint(geom,0,ST_SetSRID(ST_MakePoint(%s,%s),4326)),updated_at=now() WHERE source_kind=%s AND source_id=%s",(*point,kind,element_id))
   q.execute("UPDATE links SET geom=ST_SetPoint(geom,ST_NPoints(geom)-1,ST_SetSRID(ST_MakePoint(%s,%s),4326)),updated_at=now() WHERE target_kind=%s AND target_id=%s",(*point,kind,element_id));audit(q,u,'move_element',kind,element_id,None,{'latitude':p.latitude,'longitude':p.longitude})
  return {'status':'ok'}
