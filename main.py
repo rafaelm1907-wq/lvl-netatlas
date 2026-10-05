@@ -1082,8 +1082,12 @@ def links(u=Depends(viewer)):
    for nxt in adjacent[current]:
     if nxt not in visited:visited.add(nxt);stack.append(nxt)
   if values:
-   state='down' if 'down' in values else 'up' if all(v=='up' for v in values) else 'unknown'
-   for current in component:statuses[current]=state
+   inherited_state='down' if 'down' in values else 'up' if all(v=='up' for v in values) else 'unknown'
+   for current in component:
+    # Um enlace que possui interface monitorada tem estado próprio. A herança
+    # existe somente para os trechos totalmente passivos (por exemplo, depois
+    # de uma CTO), evitando que um DOWN vizinho contamine duas pontas UP.
+    if not endpoint_values[current]:statuses[current]=inherited_state
  out=[]
  for r in rs:
   d=dict(r);d['geometry']=json.loads(d['geometry']);d['status']=statuses[r['id']];d['passive_nodes']=passive_by_link.get(r['id'],[]);d['created_at']=d['created_at'].isoformat();d['updated_at']=d['updated_at'].isoformat();out.append(d)
