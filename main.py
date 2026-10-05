@@ -12,7 +12,7 @@ app=FastAPI(title="LVL - NetAtlas",version="0.2.0")
 app.mount("/static",StaticFiles(directory="/opt/netatlas/static"),name="static")
 NETBOX_URL=os.getenv("NETBOX_URL","").rstrip("/"); NETBOX_TOKEN=os.getenv("NETBOX_TOKEN","")
 OSRM_URL=os.getenv("OSRM_URL","https://router.project-osrm.org").rstrip("/")
-ZHOST=os.getenv("ZABBIX_DB_HOST",""); ZPORT=int(os.getenv("ZABBIX_DB_PORT","3306")); ZNAME=os.getenv("ZABBIX_DB_NAME","zabbix"); ZUSER=os.getenv("ZABBIX_DB_USER",""); ZPASS=os.getenv("ZABBIX_DB_PASSWORD","")
+ZHOST=os.getenv("ZABBIX_DB_HOST",""); ZPORT=int(os.getenv("ZABBIX_DB_PORT","3306")); ZNAME=os.getenv("ZABBIX_DB_NAME","zabbix"); ZUSER=os.getenv("ZABBIX_DB_USER",""); ZPASS=os.getenv("ZABBIX_DB_PASSWORD",""); ZREAD_TIMEOUT=int(os.getenv("ZABBIX_DB_READ_TIMEOUT","60"))
 DB_DSN=os.getenv("NETATLAS_DB_DSN","postgresql://netatlas_app@127.0.0.1/netatlas")
 LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","https://lvllicencas.lvltech.com.br").rstrip('/')
 LICENSE_PRODUCT=os.getenv("LICENSE_PRODUCT","LVL - NetAtlas")
@@ -56,7 +56,7 @@ class OperatorInterfaceIn(BaseModel):
  zabbix_hostid:int; interface_itemid:int; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None; provider_name:str=Field(min_length=1,max_length=120); address_family:str=Field(pattern='^(ipv4|ipv6|dual)$')
 
 def pg(): return psycopg.connect(DB_DSN,row_factory=psycopg.rows.dict_row)
-def zconn(): return pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=5,read_timeout=10,cursorclass=pymysql.cursors.DictCursor)
+def zconn(): return pymysql.connect(host=ZHOST,port=ZPORT,user=ZUSER,password=ZPASS,database=ZNAME,connect_timeout=5,read_timeout=ZREAD_TIMEOUT,cursorclass=pymysql.cursors.DictCursor)
 def password_hash(password,salt=None):
  salt=salt or secrets.token_bytes(16);digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,310000);return salt.hex(),digest.hex()
 def verify_password(password,salt,digest):return hmac.compare_digest(password_hash(password,bytes.fromhex(salt))[1],digest)
