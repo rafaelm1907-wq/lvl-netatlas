@@ -16,9 +16,14 @@ ZHOST=os.getenv("ZABBIX_DB_HOST",""); ZPORT=int(os.getenv("ZABBIX_DB_PORT","3306
 DB_DSN=os.getenv("NETATLAS_DB_DSN","postgresql://netatlas_app@127.0.0.1/netatlas")
 LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","https://lvllicencas.lvltech.com.br").rstrip('/')
 LICENSE_PRODUCT=os.getenv("LICENSE_PRODUCT","LVL - NetAtlas")
+LICENSE_KEY=os.getenv("NETATLAS_LICENSE_KEY","").strip()
+OLT_MANAGER_URL=os.getenv("OLT_MANAGER_URL","http://172.16.210.51:6000").rstrip('/')
+OLT_MANAGER_TOKEN=os.getenv("OLT_MANAGER_TOKEN","")
+GITHUB_REPOSITORY=os.getenv('NETATLAS_GITHUB_REPOSITORY','rafaelm1907-wq/lvl-netatlas').strip('/')
+INSTALL_DIR='/opt/netatlas'
 
 class NodeIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None
+ name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None; splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$"); splitter_name:str|None=Field(default=None,max_length=120)
 class PopIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class PositionIn(BaseModel):
@@ -35,7 +40,7 @@ class LinkNameIn(BaseModel): name:str=Field(min_length=1,max_length=200)
 class LinkInterfaceIn(BaseModel):
  interface_itemid:int|None=None; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None
 class LinkCtoIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$")
+ name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$"); input_side:str|None=Field(default=None,pattern="^(source|target)$")
 class ZabbixHostImportIn(BaseModel):
  hostid:int; site_id:int
 class ZabbixHostsImportIn(BaseModel):
@@ -53,7 +58,17 @@ class LicenseActivateIn(BaseModel):
 class BgpFeatureIn(BaseModel):
  enabled:bool; zabbix_hostid:int
 class OperatorInterfaceIn(BaseModel):
- zabbix_hostid:int; interface_itemid:int; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None; provider_name:str=Field(min_length=1,max_length=120); address_family:str=Field(pattern='^(ipv4|ipv6|dual)$')
+ zabbix_hostid:int; interface_itemid:int; interface_name:str=Field(min_length=1,max_length=300); interface_description:str|None=None; provider_name:str=Field(min_length=1,max_length=120); address_family:str=Field(pattern='^(ipv4|ipv6|dual)$'); subtitle:str|None=Field(default=None,max_length=160)
+class CtoSplitterIn(BaseModel):
+ name:str=Field(min_length=1,max_length=120); splitter_type:str=Field(pattern="^1x(2|4|8|16|32)$"); olt_id:str=Field(min_length=1,max_length=120); sfp:str=Field(pattern=r"^\d+/\d+/\d+$"); link_id:int|None=None
+class CtoOutputIn(BaseModel):
+ name:str=Field(min_length=1,max_length=120); output_kind:str=Field(pattern="^(customers|continuation|unused)$")
+class CtoClientSelectionIn(BaseModel):
+ ont_numbers:list[int]=Field(default_factory=list,max_length=512)
+class AlertAckIn(BaseModel):
+ alert_key:str=Field(min_length=3,max_length=200)
+class AlertAckSyncIn(BaseModel):
+ active_keys:list[str]=Field(default_factory=list,max_length=1000)
 
 def pg(): return psycopg.connect(DB_DSN,row_factory=psycopg.rows.dict_row)
 def zconn():
@@ -116,20 +131,37 @@ viewer=roles('superadmin','admin','technician');operator=roles('superadmin','adm
 @app.on_event("startup")
 def startup():
  with pg() as c,c.cursor() as q:
+  # Os workers do bootstrap em paralelo; o lock evita DDL concorrente e deadlocks.
+  q.execute('SELECT pg_advisory_xact_lock(748215005)')
   q.execute("""CREATE TABLE IF NOT EXISTS nodes(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'cto',geom geometry(Point,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE TABLE IF NOT EXISTS element_positions(element_kind TEXT NOT NULL,element_id BIGINT NOT NULL,geom geometry(Point,4326) NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(element_kind,element_id));CREATE TABLE IF NOT EXISTS links(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,source_kind TEXT NOT NULL,source_id BIGINT NOT NULL,source_name TEXT NOT NULL,source_zabbix_hostid BIGINT,source_interface_itemid BIGINT,source_interface_name TEXT,source_interface_description TEXT,target_kind TEXT NOT NULL,target_id BIGINT NOT NULL,target_name TEXT NOT NULL,target_zabbix_hostid BIGINT,target_interface_itemid BIGINT,target_interface_name TEXT,target_interface_description TEXT,parent_link_id BIGINT REFERENCES links(id) ON DELETE SET NULL,geom geometry(LineString,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS links_geom_gix ON links USING GIST(geom);CREATE INDEX IF NOT EXISTS nodes_geom_gix ON nodes USING GIST(geom);
 CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,username TEXT NOT NULL UNIQUE,display_name TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('superadmin','admin','technician')),password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS issues(id BIGSERIAL PRIMARY KEY,target_kind TEXT NOT NULL CHECK(target_kind IN('device','node','link')),target_id BIGINT NOT NULL,target_name TEXT NOT NULL,severity TEXT NOT NULL CHECK(severity IN('medium','severe','disaster')),description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','validated','resolved')),reported_by BIGINT NOT NULL REFERENCES users(id),validated_by BIGINT REFERENCES users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),validated_at TIMESTAMPTZ,resolved_at TIMESTAMPTZ);CREATE INDEX IF NOT EXISTS issues_target_idx ON issues(target_kind,target_id,status);
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL,actor_role TEXT NOT NULL,action TEXT NOT NULL,target_kind TEXT NOT NULL,target_id BIGINT,target_name TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC)""")
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+  if LICENSE_KEY:
+   q.execute('SELECT license_key FROM license_config WHERE id=1');configured=q.fetchone()
+   if not configured:
+    data,_=check_license(LICENSE_KEY);q.execute("INSERT INTO license_config(id,license_key,valid,last_checked_at,last_response)VALUES(1,%s,%s,now(),%s)",(LICENSE_KEY,bool(data.get('valid')),json.dumps(data)))
   q.execute("CREATE TABLE IF NOT EXISTS bgp_devices(device_id BIGINT PRIMARY KEY,zabbix_hostid BIGINT NOT NULL,enabled BOOLEAN NOT NULL DEFAULT true,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+  q.execute("CREATE TABLE IF NOT EXISTS notification_acknowledgements(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,alert_key TEXT NOT NULL,acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(user_id,alert_key))")
   q.execute("CREATE TABLE IF NOT EXISTS bgp_operator_interfaces(id BIGSERIAL PRIMARY KEY,device_id BIGINT NOT NULL,zabbix_hostid BIGINT NOT NULL,interface_itemid BIGINT NOT NULL,interface_name TEXT NOT NULL,interface_description TEXT,provider_name TEXT NOT NULL,image_data BYTEA,image_content_type TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(device_id,interface_itemid))")
   q.execute("ALTER TABLE bgp_operator_interfaces ADD COLUMN IF NOT EXISTS address_family TEXT NOT NULL DEFAULT 'ipv4'")
+  q.execute("ALTER TABLE bgp_operator_interfaces ADD COLUMN IF NOT EXISTS subtitle TEXT")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
+  q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_name TEXT')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
-  q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,splitter_type TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));ALTER TABLE link_passive_nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
+  q.execute("CREATE TABLE IF NOT EXISTS link_passive_nodes(link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,node_id BIGINT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,position_fraction DOUBLE PRECISION NOT NULL DEFAULT .5,splitter_type TEXT,input_side TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(link_id,node_id));ALTER TABLE link_passive_nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;ALTER TABLE link_passive_nodes ADD COLUMN IF NOT EXISTS input_side TEXT;CREATE INDEX IF NOT EXISTS link_passive_nodes_link_idx ON link_passive_nodes(link_id)")
+  q.execute("""CREATE TABLE IF NOT EXISTS cto_splitters(id BIGSERIAL PRIMARY KEY,node_id BIGINT NOT NULL UNIQUE REFERENCES nodes(id) ON DELETE CASCADE,name TEXT NOT NULL,splitter_type TEXT NOT NULL,olt_id TEXT NOT NULL,sfp TEXT NOT NULL,link_id BIGINT REFERENCES links(id) ON DELETE SET NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS cto_splitter_outputs(id BIGSERIAL PRIMARY KEY,splitter_id BIGINT NOT NULL REFERENCES cto_splitters(id) ON DELETE CASCADE,output_number INTEGER NOT NULL,name TEXT NOT NULL,output_kind TEXT NOT NULL DEFAULT 'unused',created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(splitter_id,output_number));
+CREATE TABLE IF NOT EXISTS cto_ont_assignments(id BIGSERIAL PRIMARY KEY,output_id BIGINT NOT NULL REFERENCES cto_splitter_outputs(id) ON DELETE CASCADE,olt_id TEXT NOT NULL,sfp TEXT NOT NULL,ont_number INTEGER NOT NULL,ont_name TEXT,serial TEXT,status TEXT,rx_power DOUBLE PRECISION,vlans JSONB NOT NULL DEFAULT '[]'::jsonb,last_collected_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),UNIQUE(olt_id,sfp,ont_number));CREATE INDEX IF NOT EXISTS cto_ont_output_idx ON cto_ont_assignments(output_id)""")
+  q.execute("ALTER TABLE cto_splitters ALTER COLUMN olt_id DROP NOT NULL;ALTER TABLE cto_splitters ALTER COLUMN sfp DROP NOT NULL;ALTER TABLE cto_ont_assignments ADD COLUMN IF NOT EXISTS geom geometry(Point,4326);CREATE INDEX IF NOT EXISTS cto_ont_geom_gix ON cto_ont_assignments USING GIST(geom)")
+  q.execute("""INSERT INTO cto_splitters(node_id,name,splitter_type)
+SELECT id,COALESCE(splitter_name,'Splitter '||name),splitter_type FROM nodes WHERE kind='cto' AND splitter_type IS NOT NULL ON CONFLICT(node_id)DO NOTHING""")
+  q.execute("""INSERT INTO cto_splitter_outputs(splitter_id,output_number,name)
+SELECT s.id,n,'Saída '||n FROM cto_splitters s CROSS JOIN LATERAL generate_series(1,split_part(s.splitter_type,'x',2)::integer) n ON CONFLICT(splitter_id,output_number)DO NOTHING""")
   # A consolidação dos registros antigos é deliberadamente opt-in: ela remove trechos filhos.
   # Habilite somente depois de criar backup: MIGRATE_LEGACY_SPLIT_LINKS=true.
   while os.getenv('MIGRATE_LEGACY_SPLIT_LINKS','false').lower()=='true':
@@ -158,6 +190,64 @@ def audit(q,u,action,target_kind,target_id=None,target_name=None,details=None):
 def nbrequest(method,path,payload=None):
  with httpx.Client(timeout=25,headers={"Authorization":f"Token {NETBOX_TOKEN}","Content-Type":"application/json"}) as c:
   r=c.request(method,f"{NETBOX_URL}{path}",json=payload);r.raise_for_status();return r.json() if r.content else None
+def olt_manager_get(path,params=None):
+ if not OLT_MANAGER_TOKEN:raise HTTPException(503,'A integração com o gerenciador de OLTs ainda não possui token configurado')
+ try:
+  with httpx.Client(timeout=20,headers={'Authorization':f'Bearer {OLT_MANAGER_TOKEN}'}) as c:
+   r=c.get(f'{OLT_MANAGER_URL}{path}',params=params)
+   try:data=r.json()
+   except ValueError:data={}
+   if r.status_code>=400:raise HTTPException(502,data.get('error') or f'O gerenciador de OLTs respondeu HTTP {r.status_code}')
+   return data
+ except HTTPException:raise
+ except httpx.HTTPError as e:raise HTTPException(502,f'Não foi possível consultar o gerenciador de OLTs: {e}')
+def pon_sfp(interface_name):
+ match=re.search(r'(?:XGS?-?PON|GPON|PON)\s*[-:]?\s*(\d+/\d+/\d+)',interface_name or '',re.I)
+ return match.group(1) if match else None
+def cto_pon_contexts(node_id,manager_olts=None):
+ with pg() as c,c.cursor() as q:
+  q.execute("""SELECT DISTINCT l.id link_id,l.name link_name,l.source_zabbix_hostid,l.source_name,l.source_interface_name,l.target_zabbix_hostid,l.target_name,l.target_interface_name
+FROM links l LEFT JOIN link_passive_nodes pn ON pn.link_id=l.id
+WHERE (l.source_kind='node' AND l.source_id=%s) OR (l.target_kind='node' AND l.target_id=%s) OR pn.node_id=%s ORDER BY l.id""",(node_id,node_id,node_id));linked=q.fetchall()
+ contexts=[]
+ for link in linked:
+  for side in ('source','target'):
+   host_id=link[f'{side}_zabbix_hostid'];name=link[f'{side}_interface_name'];sfp=pon_sfp(name)
+   if not host_id or not sfp:continue
+   try:
+    with closing(zconn()) as z,z.cursor() as cursor:
+     cursor.execute("SELECT ip,dns FROM interface WHERE hostid=%s ORDER BY main DESC,interfaceid",(host_id,));addresses=[value for row in cursor.fetchall() for value in (row.get('ip'),row.get('dns')) if value]
+   except Exception:addresses=[]
+   contexts.append({'link_id':int(link['link_id']),'link_name':link['link_name'],'zabbix_hostid':int(host_id),'host_name':link[f'{side}_name'],'interface_name':name,'sfp':sfp,'host_addresses':list(dict.fromkeys(addresses))})
+ unique=[];seen=set()
+ for context in contexts:
+  key=(context['link_id'],context['zabbix_hostid'],context['sfp'])
+  if key in seen:continue
+  seen.add(key);unique.append(context)
+ if manager_olts is not None:
+  for context in unique:
+   matches=[olt['id'] for olt in manager_olts if olt.get('host') in context['host_addresses']]
+   context['suggested_olt_id']=matches[0] if len(matches)==1 else None
+ return unique
+def sync_cto_distribution_to_netbox(q,node_id):
+ q.execute('SELECT id,name,netbox_device_id FROM nodes WHERE id=%s AND kind=\'cto\'',(node_id,));node=q.fetchone()
+ if not node or not node['netbox_device_id']:return
+ q.execute("""SELECT s.name,s.splitter_type,s.olt_id,s.sfp,o.output_number,o.name output_name,o.output_kind,count(a.id) client_count,string_agg(concat(a.ont_number,':',COALESCE(a.serial,'')),', ' ORDER BY a.ont_number) clients
+FROM cto_splitters s JOIN cto_splitter_outputs o ON o.splitter_id=s.id LEFT JOIN cto_ont_assignments a ON a.output_id=o.id
+WHERE s.node_id=%s GROUP BY s.name,s.splitter_type,s.olt_id,s.sfp,o.output_number,o.name,o.output_kind ORDER BY o.output_number""",(node_id,));rows=q.fetchall()
+ if not rows:return
+ device=nbrequest('GET',f"/api/dcim/devices/{node['netbox_device_id']}/")
+ comments=device.get('comments') or ''
+ marker_start='<!-- NETATLAS-SPLITTER -->';marker_end='<!-- /NETATLAS-SPLITTER -->'
+ block=[marker_start,f"Splitter: {rows[0]['name']} ({rows[0]['splitter_type']})",f"Origem: {rows[0]['olt_id']} · PON {rows[0]['sfp']}"]
+ for row in rows:
+  detail=f"Saída {row['output_number']}: {row['output_name']} [{row['output_kind']}] · {row['client_count']} cliente(s)"
+  if row['clients']:detail+=f" · {row['clients']}"
+  block.append(detail)
+ block.append(marker_end);managed='\n'.join(block)
+ if marker_start in comments and marker_end in comments:comments=re.sub(re.escape(marker_start)+r'.*?'+re.escape(marker_end),managed,comments,flags=re.S)
+ else:comments=f"{comments.rstrip()}\n\n{managed}".strip()
+ nbrequest('PATCH',f"/api/dcim/devices/{node['netbox_device_id']}/",{'comments':comments})
 def slugify(value):
  value=unicodedata.normalize('NFKD',value).encode('ascii','ignore').decode().lower();return re.sub(r'[^a-z0-9]+','-',value).strip('-')[:100]
 def nbensure(path,slug,payload):
@@ -181,7 +271,8 @@ def sync_node_to_netbox(node,site_id=None):
  marker=f"NetAtlas node ID: {node['id']}";found=nbget(f"/api/dcim/devices/?name={node['name']}&site_id={site['id']}&limit=10")
  for device in found:
   if marker in (device.get('comments') or ''):return device
- payload={'name':node['name'],'device_type':dtype['id'],'role':role['id'],'site':site['id'],'status':'planned' if node['kind']=='host' else 'active','latitude':round(float(node['latitude']),6),'longitude':round(float(node['longitude']),6),'description':f'{role_name} cadastrada pelo LVL - NetAtlas','comments':f"{marker}\nTipo: {node['kind']}"}
+ splitter_note=f"\nSplitter: {node.get('splitter_name') or node.get('splitter_type')} ({node.get('splitter_type')})" if node.get('splitter_type') else ''
+ payload={'name':node['name'],'device_type':dtype['id'],'role':role['id'],'site':site['id'],'status':'planned' if node['kind']=='host' else 'active','latitude':round(float(node['latitude']),6),'longitude':round(float(node['longitude']),6),'description':f'{role_name} cadastrada pelo LVL - NetAtlas','comments':f"{marker}\nTipo: {node['kind']}{splitter_note}"}
  return nbrequest('POST','/api/dcim/devices/',payload)
 def sync_zabbix_host_to_netbox(host,ifaces,site_id):
  manufacturer=nbensure('/api/dcim/manufacturers/','zabbix-import',{'name':'Zabbix Import','slug':'zabbix-import','description':'Inventário importado pelo LVL - NetAtlas a partir do Zabbix'})
@@ -276,6 +367,33 @@ def create_user(x:UserIn,u=Depends(superadmin)):
 def audit_events(limit:int=200,u=Depends(superadmin)):
  limit=max(1,min(limit,500))
  with pg() as c,c.cursor() as q:q.execute('SELECT id,actor_username,actor_role,action,target_kind,target_id,target_name,details,created_at FROM audit_log ORDER BY id DESC LIMIT %s',(limit,));return q.fetchall()
+
+def installed_revision():
+ try:return subprocess.run(['git','-c',f'safe.directory={INSTALL_DIR}','-C',INSTALL_DIR,'rev-parse','HEAD'],capture_output=True,text=True,timeout=8,check=True).stdout.strip()
+ except (subprocess.SubprocessError,OSError):return None
+
+@app.get('/api/update/status')
+def update_status(u=Depends(operator)):
+ current=installed_revision()
+ if not current:raise HTTPException(503,'Esta instalação não possui uma revisão Git válida')
+ try:
+  with httpx.Client(timeout=20,headers={'Accept':'application/vnd.github+json','User-Agent':'LVL-NetAtlas-Updater'}) as client:
+   response=client.get(f'https://api.github.com/repos/{GITHUB_REPOSITORY}/compare/{current}...main')
+   if response.status_code==404:
+    latest=client.get(f'https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/main');latest.raise_for_status();target=latest.json()['sha']
+    return {'current':current,'latest':target,'available':False,'local_ahead':current!=target,'commits':[],'repository':GITHUB_REPOSITORY}
+   response.raise_for_status();data=response.json()
+ except (httpx.HTTPError,ValueError,KeyError) as error:raise HTTPException(502,f'Não foi possível consultar atualizações no GitHub: {error}')
+ commits=[{'sha':item['sha'][:7],'message':item['commit']['message'].splitlines()[0]} for item in data.get('commits',[])[:20]]
+ return {'current':current,'latest':data.get('merge_base_commit',{}).get('sha') if data.get('status')=='behind' else (data.get('commits') or [{'sha':current}])[-1]['sha'],'available':data.get('status') in ('ahead','diverged') and int(data.get('ahead_by',0))>0,'local_ahead':data.get('status')=='behind','commits':commits,'repository':GITHUB_REPOSITORY}
+
+@app.post('/api/update/apply')
+def apply_update(u=Depends(operator)):
+ try:
+  process=subprocess.Popen(['sudo','-n','/usr/local/sbin/netatlas-update'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+ except OSError as error:raise HTTPException(503,f'Não foi possível iniciar a atualização: {error}')
+ with pg() as c,c.cursor() as q:audit(q,u,'apply_update','system',None,'GitHub',{'repository':GITHUB_REPOSITORY,'from_revision':installed_revision(),'process_id':process.pid})
+ return {'status':'started','message':'Atualização iniciada. O serviço será reiniciado automaticamente.'}
 
 @app.get('/api/license')
 def license_status(u=Depends(viewer)):
@@ -398,7 +516,7 @@ def device_bgp_peers(device_id:int,u=Depends(viewer)):
  return {'device_id':device_id,'zabbix_hostid':configured['zabbix_hostid'],'peers':peers,'count':len(peers)}
 
 def operator_interfaces_for_device(device_id:int,u):
- with pg() as c,c.cursor() as q:q.execute('SELECT id,device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name,address_family,image_data IS NOT NULL has_image,updated_at FROM bgp_operator_interfaces WHERE device_id=%s ORDER BY provider_name,address_family,interface_name',(device_id,));configured=q.fetchall()
+ with pg() as c,c.cursor() as q:q.execute('SELECT id,device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name,address_family,subtitle,image_data IS NOT NULL has_image,updated_at FROM bgp_operator_interfaces WHERE device_id=%s ORDER BY provider_name,address_family,interface_name',(device_id,));configured=q.fetchall()
  if not configured:return []
  live=interfaces(int(configured[0]['zabbix_hostid']),u)
  for row in configured:
@@ -414,7 +532,7 @@ def save_operator_interface(device_id:int,x:OperatorInterfaceIn,u=Depends(operat
  with pg() as c,c.cursor() as q:
   q.execute('SELECT 1 FROM bgp_devices WHERE device_id=%s AND zabbix_hostid=%s AND enabled',(device_id,x.zabbix_hostid))
   if not q.fetchone():raise HTTPException(422,'Ative o monitoramento BGP neste host antes de marcar interfaces de operadora')
-  q.execute("INSERT INTO bgp_operator_interfaces(device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name,address_family)VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(device_id,interface_itemid)DO UPDATE SET interface_name=excluded.interface_name,interface_description=excluded.interface_description,provider_name=excluded.provider_name,address_family=excluded.address_family,updated_at=now() RETURNING id",(device_id,x.zabbix_hostid,x.interface_itemid,x.interface_name,x.interface_description,x.provider_name.strip(),x.address_family));oid=q.fetchone()['id'];audit(q,u,'mark_operator_interface','device',device_id,x.provider_name.strip(),{'operator_interface_id':oid,'interface_itemid':x.interface_itemid,'interface_name':x.interface_name,'address_family':x.address_family})
+  q.execute("INSERT INTO bgp_operator_interfaces(device_id,zabbix_hostid,interface_itemid,interface_name,interface_description,provider_name,address_family,subtitle)VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(device_id,interface_itemid)DO UPDATE SET interface_name=excluded.interface_name,interface_description=excluded.interface_description,provider_name=excluded.provider_name,address_family=excluded.address_family,subtitle=excluded.subtitle,updated_at=now() RETURNING id",(device_id,x.zabbix_hostid,x.interface_itemid,x.interface_name,x.interface_description,x.provider_name.strip(),x.address_family,(x.subtitle or '').strip() or None));oid=q.fetchone()['id'];audit(q,u,'mark_operator_interface','device',device_id,x.provider_name.strip(),{'operator_interface_id':oid,'interface_itemid':x.interface_itemid,'interface_name':x.interface_name,'address_family':x.address_family,'subtitle':(x.subtitle or '').strip() or None})
  return {'id':oid,'provider_name':x.provider_name.strip(),'address_family':x.address_family}
 
 @app.delete('/api/operator-interfaces/{operator_id}',status_code=204)
@@ -447,6 +565,27 @@ def operator_image(operator_id:int,u=Depends(viewer)):
 def all_operator_interfaces(u=Depends(viewer)):
  with pg() as c,c.cursor() as q:q.execute('SELECT DISTINCT oi.device_id FROM bgp_operator_interfaces oi JOIN bgp_devices b ON b.device_id=oi.device_id AND b.enabled ORDER BY oi.device_id');device_ids=[int(r['device_id']) for r in q.fetchall()]
  return [{'device_id':device_id,'interfaces':operator_interfaces_for_device(device_id,u)} for device_id in device_ids]
+
+@app.get('/api/devices/{device_id}/operator-traffic')
+def operator_traffic(device_id:int,provider:str,minutes:int=30,u=Depends(viewer)):
+ if minutes not in (30,60,180):raise HTTPException(422,'Período inválido. Use 30, 60 ou 180 minutos')
+ configured=[item for item in operator_interfaces_for_device(device_id,u) if item['provider_name'].casefold()==provider.casefold()]
+ if not configured:raise HTTPException(404,'Operadora não encontrada neste host')
+ rx_ids={int(item['metrics']['rx_itemid']) for item in configured if item.get('metrics') and item['metrics'].get('rx_itemid')};tx_ids={int(item['metrics']['tx_itemid']) for item in configured if item.get('metrics') and item['metrics'].get('tx_itemid')};item_ids=sorted(rx_ids|tx_ids)
+ if not item_ids:return {'provider':provider,'minutes':minutes,'series':[]}
+ since=int(time.time())-minutes*60;marks=','.join(['%s']*len(item_ids));sql=f"SELECT itemid,clock,value FROM history_uint WHERE itemid IN ({marks}) AND clock>=%s UNION ALL SELECT itemid,clock,value FROM history WHERE itemid IN ({marks}) AND clock>=%s ORDER BY clock"
+ with closing(zconn()) as c,c.cursor() as q:q.execute(sql,tuple(item_ids)+(since,)+tuple(item_ids)+(since,));rows=q.fetchall()
+ bucket_seconds=60 if minutes==30 else 120 if minutes==60 else 300;buckets={}
+ for row in rows:
+  bucket=int(row['clock'])//bucket_seconds*bucket_seconds;buckets.setdefault(bucket,{})[int(row['itemid'])]=float(row['value'])
+ series=[]
+ for item in configured:
+  metrics=item.get('metrics') or {};rx_id=int(metrics['rx_itemid']) if metrics.get('rx_itemid') else None;tx_id=int(metrics['tx_itemid']) if metrics.get('tx_itemid') else None;points=[]
+  for clock,values in sorted(buckets.items()):
+   if rx_id not in values and tx_id not in values:continue
+   points.append({'clock':clock,'rx_bps':values.get(rx_id) if rx_id else None,'tx_bps':values.get(tx_id) if tx_id else None})
+  series.append({'interface_itemid':item['interface_itemid'],'interface_name':item['interface_name'],'subtitle':item.get('subtitle'),'address_family':item['address_family'],'status':metrics.get('status','unknown'),'points':points[-181:]})
+ return {'provider':provider,'minutes':minutes,'series':series}
 
 @app.get('/api/host-statuses')
 def host_statuses(ids:str='',u=Depends(viewer)):
@@ -613,11 +752,182 @@ def interfaces(host_id:int,u=Depends(viewer)):
   rxid=chosen.get((key,'rx'),(None,None))[1];txid=chosen.get((key,'tx'),(None,None))[1];rx=signal_vals.get(rxid);tx=signal_vals.get(txid)
   g['optical_rx_dbm']=rx['value'] if rx else None;g['optical_rx_clock']=rx['clock'] if rx else None
   g['optical_tx_dbm']=tx['value'] if tx else None;g['optical_tx_clock']=tx['clock'] if tx else None
- return sorted(groups.values(),key=lambda x:x['name'].lower())
+ def natural_interface_key(item):
+  return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)',item['name'])]
+ return sorted(groups.values(),key=natural_interface_key)
+
+def require_cto(q,node_id):
+ q.execute("SELECT id,name,netbox_device_id FROM nodes WHERE id=%s AND kind='cto'",(node_id,));node=q.fetchone()
+ if not node:raise HTTPException(404,'CTO não encontrada')
+ return node
+def manager_olts():return olt_manager_get('/api/integration/olts').get('olts',[])
+def manager_onts(olt_id,sfp):return olt_manager_get('/api/integration/onts',{'olt':olt_id,'sfp':sfp})
+def manager_olt_name(olt_id,olts=None):
+ olts=olts if olts is not None else manager_olts();match=next((item for item in olts if str(item.get('id'))==str(olt_id)),None)
+ return (match or {}).get('name') or (match or {}).get('label') or str(olt_id)
+def saved_cto_distribution(node_id):
+ with pg() as c,c.cursor() as q:
+  require_cto(q,node_id)
+  q.execute('SELECT id,node_id,name,splitter_type,olt_id,sfp,link_id,created_at,updated_at FROM cto_splitters WHERE node_id=%s',(node_id,));splitter=q.fetchone()
+  if not splitter:return None
+  splitter=dict(splitter);splitter['created_at']=splitter['created_at'].isoformat();splitter['updated_at']=splitter['updated_at'].isoformat()
+  q.execute("""SELECT o.id,o.output_number,o.name,o.output_kind,a.id assignment_id,a.ont_number,a.ont_name,a.serial,a.status,a.rx_power,a.vlans,a.last_collected_at,ST_Y(a.geom) latitude,ST_X(a.geom) longitude
+FROM cto_splitter_outputs o LEFT JOIN cto_ont_assignments a ON a.output_id=o.id WHERE o.splitter_id=%s ORDER BY o.output_number,a.ont_number""",(splitter['id'],));rows=q.fetchall()
+ outputs=[];by_id={}
+ for row in rows:
+  output=by_id.get(row['id'])
+  if not output:
+   output={'id':row['id'],'output_number':row['output_number'],'name':row['name'],'output_kind':row['output_kind'],'clients':[]};outputs.append(output);by_id[row['id']]=output
+  if row['assignment_id']:
+   output['clients'].append({'assignment_id':row['assignment_id'],'number':row['ont_number'],'id':row['ont_number'],'name':row['ont_name'],'serial':row['serial'],'status':row['status'],'rx_power':row['rx_power'],'vlans':row['vlans'] or [],'collected_at':row['last_collected_at'].isoformat() if row['last_collected_at'] else None,'latitude':row['latitude'],'longitude':row['longitude']})
+ splitter['outputs']=outputs;return splitter
+def refresh_cto_clients(splitter):
+ warning=None
+ if not splitter.get('olt_id') or not splitter.get('sfp'):
+  splitter['pon_status']='unknown';splitter['warning']='Aguardando vínculo com uma porta GPON';return splitter
+ try:data=manager_onts(splitter['olt_id'],splitter['sfp'])
+ except HTTPException as error:data=None;warning=str(error.detail)
+ if data:
+  live={int(ont['number']):ont for ont in data.get('onts',[]) if ont.get('number') is not None}
+  with pg() as c,c.cursor() as q:
+   for output in splitter['outputs']:
+    for client in output['clients']:
+     ont=live.get(int(client['number']))
+     if not ont:continue
+     q.execute("UPDATE cto_ont_assignments SET ont_name=%s,serial=%s,status=%s,rx_power=%s,vlans=%s,last_collected_at=%s,updated_at=now() WHERE id=%s",(ont.get('name'),ont.get('serial'),ont.get('status'),ont.get('rx_power'),json.dumps(ont.get('vlans') or []),data.get('collected_at'),client['assignment_id']))
+     client.update({'name':ont.get('name'),'serial':ont.get('serial'),'status':ont.get('status'),'rx_power':ont.get('rx_power'),'vlans':ont.get('vlans') or [],'collected_at':data.get('collected_at')})
+  splitter['pon_status']=(data.get('pon') or {}).get('status');splitter['collected_at']=data.get('collected_at');splitter['olt_name']=data.get('olt_name') or data.get('olt') or manager_olt_name(splitter['olt_id'])
+ splitter['warning']=warning;return splitter
+
+@app.get('/api/olt-manager/olts')
+def list_manager_olts(u=Depends(viewer)):
+ return {'olts':manager_olts()}
+
+@app.get('/api/ctos/{node_id}/pon-contexts')
+def cto_contexts(node_id:int,u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:require_cto(q,node_id)
+ olts=manager_olts();return {'contexts':cto_pon_contexts(node_id,olts),'olts':olts}
+
+@app.get('/api/ctos/{node_id}/distribution')
+def get_cto_distribution(node_id:int,u=Depends(viewer)):
+ splitter=saved_cto_distribution(node_id)
+ if splitter and (not splitter.get('olt_id') or not splitter.get('sfp')):
+  try:
+   olts=manager_olts();contexts=cto_pon_contexts(node_id,olts);matches=[context for context in contexts if context.get('suggested_olt_id') and (not splitter.get('sfp') or context['sfp']==splitter['sfp'])]
+   if len(matches)==1:
+    context=matches[0]
+    with pg() as c,c.cursor() as q:q.execute('UPDATE cto_splitters SET olt_id=%s,sfp=%s,link_id=%s,updated_at=now() WHERE node_id=%s',(context['suggested_olt_id'],context['sfp'],context['link_id'],node_id))
+    splitter=saved_cto_distribution(node_id)
+  except HTTPException:pass
+ with pg() as c,c.cursor() as q:q.execute("SELECT splitter_type,splitter_name FROM nodes WHERE id=%s AND kind='cto'",(node_id,));preset=q.fetchone()
+ return {'splitter':refresh_cto_clients(splitter) if splitter else None,'preset':dict(preset) if preset and preset['splitter_type'] else None}
+
+@app.put('/api/ctos/{node_id}/splitter')
+def configure_cto_splitter(node_id:int,x:CtoSplitterIn,u=Depends(operator)):
+ olts=manager_olts();olt=next((item for item in olts if item['id']==x.olt_id),None)
+ if not olt:raise HTTPException(422,'Selecione uma OLT válida do gerenciador')
+ if not any(pon.get('sfp')==x.sfp for pon in olt.get('pons',[])):raise HTTPException(422,f'A porta PON {x.sfp} não foi localizada na OLT selecionada')
+ contexts=cto_pon_contexts(node_id,olts)
+ if not any(c['sfp']==x.sfp and (x.link_id is None or c['link_id']==x.link_id) for c in contexts):raise HTTPException(422,'Esta CTO não possui um enlace conectado à porta GPON informada')
+ count=int(x.splitter_type.split('x')[1])
+ with pg() as c,c.cursor() as q:
+  node=require_cto(q,node_id)
+  q.execute("""INSERT INTO cto_splitters(node_id,name,splitter_type,olt_id,sfp,link_id)VALUES(%s,%s,%s,%s,%s,%s)
+ON CONFLICT(node_id)DO UPDATE SET name=excluded.name,splitter_type=excluded.splitter_type,olt_id=excluded.olt_id,sfp=excluded.sfp,link_id=excluded.link_id,updated_at=now() RETURNING id""",(node_id,x.name.strip(),x.splitter_type,x.olt_id,x.sfp,x.link_id));splitter_id=q.fetchone()['id']
+  q.execute('DELETE FROM cto_splitter_outputs WHERE splitter_id=%s AND output_number>%s',(splitter_id,count))
+  for number in range(1,count+1):q.execute("INSERT INTO cto_splitter_outputs(splitter_id,output_number,name)VALUES(%s,%s,%s) ON CONFLICT(splitter_id,output_number)DO NOTHING",(splitter_id,number,f'Saída {number}'))
+  q.execute('UPDATE nodes SET splitter_type=%s,splitter_name=%s,updated_at=now() WHERE id=%s',(x.splitter_type,x.name.strip(),node_id))
+  q.execute("UPDATE links SET source_splitter_type=%s WHERE source_kind='node' AND source_id=%s",(x.splitter_type,node_id));q.execute("UPDATE links SET target_splitter_type=%s WHERE target_kind='node' AND target_id=%s",(x.splitter_type,node_id));q.execute('UPDATE link_passive_nodes SET splitter_type=%s WHERE node_id=%s',(x.splitter_type,node_id))
+  sync_cto_distribution_to_netbox(q,node_id);audit(q,u,'configure_cto_splitter','node',node_id,node['name'],{'name':x.name.strip(),'splitter_type':x.splitter_type,'olt_id':x.olt_id,'sfp':x.sfp,'link_id':x.link_id})
+ return {'splitter':refresh_cto_clients(saved_cto_distribution(node_id))}
+
+@app.patch('/api/ctos/{node_id}/splitter/outputs/{output_number}')
+def update_cto_output(node_id:int,output_number:int,x:CtoOutputIn,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  node=require_cto(q,node_id);q.execute("""UPDATE cto_splitter_outputs o SET name=%s,output_kind=%s,updated_at=now() FROM cto_splitters s WHERE o.splitter_id=s.id AND s.node_id=%s AND o.output_number=%s RETURNING o.id""",(x.name.strip(),x.output_kind,node_id,output_number))
+  if not q.fetchone():raise HTTPException(404,'Saída do splitter não encontrada')
+  sync_cto_distribution_to_netbox(q,node_id);audit(q,u,'update_cto_splitter_output','node',node_id,node['name'],{'output_number':output_number,'name':x.name.strip(),'output_kind':x.output_kind})
+ return {'status':'ok'}
+
+@app.get('/api/ctos/{node_id}/clients')
+def cto_client_candidates(node_id:int,u=Depends(viewer)):
+ splitter=saved_cto_distribution(node_id)
+ if not splitter:raise HTTPException(422,'Configure o splitter desta CTO antes de adicionar clientes')
+ if not splitter.get('olt_id') or not splitter.get('sfp'):raise HTTPException(422,'Vincule o splitter a uma porta GPON antes de adicionar clientes')
+ data=manager_onts(splitter['olt_id'],splitter['sfp'])
+ with pg() as c,c.cursor() as q:
+  q.execute("""SELECT a.ont_number,o.output_number,o.name output_name,s.node_id FROM cto_ont_assignments a JOIN cto_splitter_outputs o ON o.id=a.output_id JOIN cto_splitters s ON s.id=o.splitter_id WHERE a.olt_id=%s AND a.sfp=%s""",(splitter['olt_id'],splitter['sfp']));assigned={int(row['ont_number']):dict(row) for row in q.fetchall()}
+ for ont in data.get('onts',[]):ont['assigned']=assigned.get(int(ont['number'])) if ont.get('number') is not None else None
+ return data
+
+@app.put('/api/ctos/{node_id}/splitter/outputs/{output_number}/clients')
+def save_cto_clients(node_id:int,output_number:int,x:CtoClientSelectionIn,u=Depends(operator)):
+ requested=sorted(set(int(value) for value in x.ont_numbers))
+ if any(value<0 for value in requested):raise HTTPException(422,'ID de ONT inválido')
+ splitter=saved_cto_distribution(node_id)
+ if not splitter:raise HTTPException(422,'Configure o splitter desta CTO antes de adicionar clientes')
+ if not splitter.get('olt_id') or not splitter.get('sfp'):raise HTTPException(422,'Vincule o splitter a uma porta GPON antes de adicionar clientes')
+ output=next((item for item in splitter['outputs'] if item['output_number']==output_number),None)
+ if not output:raise HTTPException(404,'Saída do splitter não encontrada')
+ data=manager_onts(splitter['olt_id'],splitter['sfp']);live={int(ont['number']):ont for ont in data.get('onts',[]) if ont.get('number') is not None}
+ missing=[number for number in requested if number not in live]
+ if missing:raise HTTPException(422,f"ONT(s) não localizada(s) na porta PON: {', '.join(map(str,missing[:10]))}")
+ with pg() as c,c.cursor() as q:
+  node=require_cto(q,node_id)
+  if requested:q.execute('DELETE FROM cto_ont_assignments WHERE output_id=%s AND NOT (ont_number=ANY(%s))',(output['id'],requested))
+  else:q.execute('DELETE FROM cto_ont_assignments WHERE output_id=%s',(output['id'],))
+  for number in requested:
+   ont=live[number];q.execute("""INSERT INTO cto_ont_assignments(output_id,olt_id,sfp,ont_number,ont_name,serial,status,rx_power,vlans,last_collected_at)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON CONFLICT(olt_id,sfp,ont_number)DO UPDATE SET output_id=excluded.output_id,ont_name=excluded.ont_name,serial=excluded.serial,status=excluded.status,rx_power=excluded.rx_power,vlans=excluded.vlans,last_collected_at=excluded.last_collected_at,updated_at=now()""",(output['id'],splitter['olt_id'],splitter['sfp'],number,ont.get('name'),ont.get('serial'),ont.get('status'),ont.get('rx_power'),json.dumps(ont.get('vlans') or []),data.get('collected_at')))
+  if requested:q.execute("UPDATE cto_splitter_outputs SET output_kind='customers',updated_at=now() WHERE id=%s",(output['id'],))
+  sync_cto_distribution_to_netbox(q,node_id);audit(q,u,'assign_cto_clients','node',node_id,node['name'],{'output_number':output_number,'client_count':len(requested),'ont_numbers':requested})
+ return {'status':'ok','count':len(requested)}
+
+@app.get('/api/ont-map-clients')
+def ont_map_clients(u=Depends(viewer)):
+ try:olt_names={str(item.get('id')):item.get('name') or item.get('label') or str(item.get('id')) for item in manager_olts()}
+ except HTTPException:olt_names={}
+ with pg() as c,c.cursor() as q:q.execute('SELECT DISTINCT olt_id,sfp FROM cto_ont_assignments WHERE geom IS NOT NULL');pons=q.fetchall()
+ for pon in pons:
+  try:data=manager_onts(pon['olt_id'],pon['sfp'])
+  except HTTPException:continue
+  live={int(ont['number']):ont for ont in data.get('onts',[]) if ont.get('number') is not None}
+  with pg() as c,c.cursor() as q:
+   for number,ont in live.items():q.execute('UPDATE cto_ont_assignments SET ont_name=%s,serial=%s,status=%s,rx_power=%s,vlans=%s,last_collected_at=%s,updated_at=now() WHERE olt_id=%s AND sfp=%s AND ont_number=%s',(ont.get('name'),ont.get('serial'),ont.get('status'),ont.get('rx_power'),json.dumps(ont.get('vlans') or []),data.get('collected_at'),pon['olt_id'],pon['sfp'],number))
+ with pg() as c,c.cursor() as q:
+  q.execute("""SELECT a.id assignment_id,s.node_id,n.name cto_name,ST_Y(n.geom) cto_latitude,ST_X(n.geom) cto_longitude,
+s.name splitter_name,s.splitter_type,s.olt_id,s.sfp,o.output_number,o.name output_name,a.ont_number,a.ont_name,a.serial,a.status,a.rx_power,a.vlans,a.last_collected_at,ST_Y(a.geom) latitude,ST_X(a.geom) longitude
+FROM cto_ont_assignments a JOIN cto_splitter_outputs o ON o.id=a.output_id JOIN cto_splitters s ON s.id=o.splitter_id JOIN nodes n ON n.id=s.node_id
+WHERE a.geom IS NOT NULL ORDER BY n.name,o.output_number,a.ont_number""");rows=q.fetchall()
+ return [{**dict(row),'olt_name':olt_names.get(str(row['olt_id']),str(row['olt_id'])),'last_collected_at':row['last_collected_at'].isoformat() if row['last_collected_at'] else None} for row in rows]
+
+@app.post('/api/alert-acknowledgements/sync')
+def sync_alert_acknowledgements(x:AlertAckSyncIn,u=Depends(viewer)):
+ active=list(dict.fromkeys(key for key in x.active_keys if key and len(key)<=200))
+ with pg() as c,c.cursor() as q:
+  if active:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND alert_key LIKE 'link:%%' AND NOT (alert_key=ANY(%s))",(u['id'],active))
+  else:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND alert_key LIKE 'link:%%'",(u['id'],))
+  q.execute('SELECT alert_key FROM notification_acknowledgements WHERE user_id=%s AND alert_key=ANY(%s)',(u['id'],active or ['']));acks=[row['alert_key'] for row in q.fetchall()]
+ return {'acknowledged':acks}
+
+@app.post('/api/alert-acknowledgements')
+def acknowledge_alert(x:AlertAckIn,u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:
+  q.execute('INSERT INTO notification_acknowledgements(user_id,alert_key)VALUES(%s,%s) ON CONFLICT(user_id,alert_key)DO UPDATE SET acknowledged_at=now()',(u['id'],x.alert_key));audit(q,u,'acknowledge_alert','notification',None,x.alert_key)
+ return {'status':'acknowledged'}
+
+@app.patch('/api/cto-clients/{assignment_id}/position')
+def position_cto_client(assignment_id:int,p:PositionIn,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute("""UPDATE cto_ont_assignments a SET geom=ST_SetSRID(ST_MakePoint(%s,%s),4326),updated_at=now() FROM cto_splitter_outputs o,cto_splitters s,nodes n
+WHERE a.id=%s AND o.id=a.output_id AND s.id=o.splitter_id AND n.id=s.node_id RETURNING a.id,a.ont_number,a.ont_name,n.id node_id,n.name cto_name,o.output_number,o.name output_name""",(p.longitude,p.latitude,assignment_id));row=q.fetchone()
+  if not row:raise HTTPException(404,'Cliente da CTO não encontrado')
+  audit(q,u,'position_cto_client','node',row['node_id'],row['cto_name'],{'assignment_id':assignment_id,'ont_number':row['ont_number'],'ont_name':row['ont_name'],'output_number':row['output_number'],'output_name':row['output_name'],'latitude':p.latitude,'longitude':p.longitude})
+ return {'status':'ok','assignment_id':assignment_id,'latitude':p.latitude,'longitude':p.longitude}
 
 @app.get('/api/nodes')
 def nodes(u=Depends(viewer)):
- with pg() as c,c.cursor() as q:q.execute('SELECT id,name,kind,ST_Y(geom) latitude,ST_X(geom) longitude,netbox_device_id,netbox_sync_error FROM nodes ORDER BY name');return q.fetchall()
+ with pg() as c,c.cursor() as q:q.execute('SELECT id,name,kind,ST_Y(geom) latitude,ST_X(geom) longitude,netbox_device_id,netbox_sync_error,splitter_type,splitter_name FROM nodes ORDER BY name');return q.fetchall()
 @app.post('/api/nodes',status_code=201)
 def create_node(n:NodeIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
@@ -626,10 +936,14 @@ def create_node(n:NodeIn,u=Depends(operator)):
   if n.kind=='host':
    try:site=netbox_site(n.site_id);latitude=float(site['latitude']);longitude=float(site['longitude'])
    except Exception as e:raise HTTPException(502,f'Não foi possível consultar o POP no NetBox: {e}')
-  q.execute('INSERT INTO nodes(name,kind,geom)VALUES(%s,%s,ST_SetSRID(ST_MakePoint(%s,%s),4326)) RETURNING id',(n.name,n.kind,longitude,latitude));nid=q.fetchone()['id'];node={'id':nid,'name':n.name,'kind':n.kind,'latitude':latitude,'longitude':longitude}
+  splitter_type=n.splitter_type if n.kind=='cto' else None;splitter_name=(n.splitter_name or f'Splitter {n.name}').strip() if splitter_type else None
+  q.execute('INSERT INTO nodes(name,kind,geom,splitter_type,splitter_name)VALUES(%s,%s,ST_SetSRID(ST_MakePoint(%s,%s),4326),%s,%s) RETURNING id',(n.name,n.kind,longitude,latitude,splitter_type,splitter_name));nid=q.fetchone()['id'];node={'id':nid,'name':n.name,'kind':n.kind,'latitude':latitude,'longitude':longitude,'splitter_type':splitter_type,'splitter_name':splitter_name}
+  if splitter_type:
+   q.execute('INSERT INTO cto_splitters(node_id,name,splitter_type)VALUES(%s,%s,%s) RETURNING id',(nid,splitter_name,splitter_type));splitter_id=q.fetchone()['id']
+   for number in range(1,int(splitter_type.split('x')[1])+1):q.execute('INSERT INTO cto_splitter_outputs(splitter_id,output_number,name)VALUES(%s,%s,%s)',(splitter_id,number,f'Saída {number}'))
   try:device=sync_node_to_netbox(node,n.site_id)
   except Exception as e:raise HTTPException(502,f'Não foi possível compartilhar o registro no NetBox: {e}')
-  q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid));audit(q,u,'create_node','node',nid,n.name,{'kind':n.kind,'site_id':n.site_id,'latitude':latitude,'longitude':longitude,'netbox_device_id':device['id']});return {'id':nid,'netbox_device_id':device['id'],'netbox_site':(device.get('site') or {}).get('name')}
+  q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid));audit(q,u,'create_node','node',nid,n.name,{'kind':n.kind,'site_id':n.site_id,'latitude':latitude,'longitude':longitude,'netbox_device_id':device['id'],'splitter_type':splitter_type,'splitter_name':splitter_name});return {'id':nid,'netbox_device_id':device['id'],'netbox_site':(device.get('site') or {}).get('name'),'splitter_type':splitter_type,'splitter_name':splitter_name}
 
 @app.delete('/api/nodes/{node_id}')
 def delete_node(node_id:int,u=Depends(operator)):
@@ -845,11 +1159,16 @@ def insert_cto_in_link(lid:int,x:LinkCtoIn,u=Depends(operator)):
   fraction=float(link['fraction'])
   if fraction<=0.000001 or fraction>=0.999999:raise HTTPException(422,'Escolha um ponto interno do enlace, afastado das extremidades')
   q.execute('SELECT ST_X(p) longitude,ST_Y(p) latitude FROM (SELECT ST_LineInterpolatePoint(%s::geometry,%s) p)s',(link['geom'],fraction));split=q.fetchone()
-  q.execute("INSERT INTO nodes(name,kind,geom)VALUES(%s,'cto',ST_SetSRID(ST_MakePoint(%s,%s),4326)) RETURNING id",(x.name.strip(),split['longitude'],split['latitude']));nid=q.fetchone()['id'];node={'id':nid,'name':x.name.strip(),'kind':'cto','latitude':split['latitude'],'longitude':split['longitude']}
+  splitter_name=f'Splitter {x.name.strip()}' if x.splitter_type else None
+  q.execute("INSERT INTO nodes(name,kind,geom,splitter_type,splitter_name)VALUES(%s,'cto',ST_SetSRID(ST_MakePoint(%s,%s),4326),%s,%s) RETURNING id",(x.name.strip(),split['longitude'],split['latitude'],x.splitter_type,splitter_name));nid=q.fetchone()['id'];node={'id':nid,'name':x.name.strip(),'kind':'cto','latitude':split['latitude'],'longitude':split['longitude'],'splitter_type':x.splitter_type,'splitter_name':splitter_name}
+  if x.splitter_type:
+   input_name=link[f'{x.input_side}_interface_name'] if x.input_side else None;sfp=pon_sfp(input_name)
+   q.execute('INSERT INTO cto_splitters(node_id,name,splitter_type,sfp,link_id)VALUES(%s,%s,%s,%s,%s) RETURNING id',(nid,splitter_name,x.splitter_type,sfp,lid));splitter_id=q.fetchone()['id']
+   for number in range(1,int(x.splitter_type.split('x')[1])+1):q.execute('INSERT INTO cto_splitter_outputs(splitter_id,output_number,name)VALUES(%s,%s,%s)',(splitter_id,number,f'Saída {number}'))
   try:device=sync_node_to_netbox(node)
   except Exception as e:raise HTTPException(502,f'Não foi possível compartilhar a CTO no NetBox: {e}')
   q.execute('UPDATE nodes SET netbox_device_id=%s,netbox_sync_error=NULL WHERE id=%s',(device['id'],nid))
-  q.execute('INSERT INTO link_passive_nodes(link_id,node_id,position_fraction,splitter_type)VALUES(%s,%s,%s,%s)',(lid,nid,fraction,x.splitter_type));audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'netbox_device_id':device['id'],'position_fraction':fraction,'splitter_type':x.splitter_type})
+  q.execute('INSERT INTO link_passive_nodes(link_id,node_id,position_fraction,splitter_type,input_side)VALUES(%s,%s,%s,%s,%s)',(lid,nid,fraction,x.splitter_type,x.input_side));audit(q,u,'insert_cto_in_link','node',nid,x.name.strip(),{'link_id':lid,'netbox_device_id':device['id'],'position_fraction':fraction,'splitter_type':x.splitter_type,'input_side':x.input_side})
  return {'node_id':nid,'link_id':lid,'latitude':split['latitude'],'longitude':split['longitude'],'netbox_device_id':device['id']}
 @app.delete('/api/links/{lid}',status_code=204)
 def delete_link(lid:int,u=Depends(superadmin)):

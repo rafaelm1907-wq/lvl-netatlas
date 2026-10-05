@@ -10,12 +10,16 @@ read -r -p 'Banco Zabbix [zabbix]: ' ZABBIX_DB_NAME; ZABBIX_DB_NAME=${ZABBIX_DB_
 read -r -p 'Usuário somente leitura do Zabbix: ' ZABBIX_DB_USER
 read -r -s -p 'Senha do usuário Zabbix: ' ZABBIX_DB_PASSWORD; echo
 read -r -s -p 'Senha inicial do Superadmin NetAtlas: ' NETATLAS_SUPERADMIN_PASSWORD; echo
-read -r -p 'URL do servidor de licenças (vazio para configurar depois): ' LICENSE_SERVER_URL
+read -r -p 'URL do servidor de licenças [https://lvllicencas.lvltech.com.br]: ' LICENSE_SERVER_URL; LICENSE_SERVER_URL=${LICENSE_SERVER_URL:-https://lvllicencas.lvltech.com.br}
+read -r -s -p 'Chave de licença do LVL - NetAtlas: ' NETATLAS_LICENSE_KEY; echo
+[[ -n "$NETATLAS_LICENSE_KEY" ]] || { echo 'A chave de licença é obrigatória para concluir a instalação.' >&2; exit 1; }
+read -r -p 'URL do gerenciador de OLTs (vazio para configurar depois): ' OLT_MANAGER_URL
+if [[ -n "$OLT_MANAGER_URL" ]]; then read -r -s -p 'Token somente leitura do gerenciador de OLTs: ' OLT_MANAGER_TOKEN; echo; else OLT_MANAGER_TOKEN=''; fi
 
 command -v apt-get >/dev/null || { echo 'Este instalador atualmente suporta Ubuntu/Debian (apt).' >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y git python3 python3-venv postgresql postgresql-contrib postgis
+apt-get install -y git sudo python3 python3-venv postgresql postgresql-contrib postgis
 INSTALL_DIR=/opt/netatlas
 [[ -d "$INSTALL_DIR/.git" ]] && { echo "$INSTALL_DIR já contém uma instalação. Atualize-a pelo Git ou escolha outro servidor." >&2; exit 1; }
 SOURCE_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -53,8 +57,14 @@ NETATLAS_DB_DSN=postgresql://netatlas_app:${DB_PASSWORD}@127.0.0.1/netatlas
 NETATLAS_SUPERADMIN_PASSWORD=${NETATLAS_SUPERADMIN_PASSWORD}
 LICENSE_SERVER_URL=${LICENSE_SERVER_URL%/}
 LICENSE_PRODUCT=LVL - NetAtlas
+NETATLAS_LICENSE_KEY=${NETATLAS_LICENSE_KEY}
+OLT_MANAGER_URL=${OLT_MANAGER_URL%/}
+OLT_MANAGER_TOKEN=${OLT_MANAGER_TOKEN}
 EOF
 install -m 0644 "$INSTALL_DIR/netatlas.service" /etc/systemd/system/netatlas.service
+install -o root -g root -m 0755 "$INSTALL_DIR/update.sh" /usr/local/sbin/netatlas-update
+printf 'netatlas ALL=(root) NOPASSWD: /usr/local/sbin/netatlas-update\n' >/etc/sudoers.d/netatlas-update
+chmod 0440 /etc/sudoers.d/netatlas-update
 chown -R netatlas:netatlas "$INSTALL_DIR"
 systemctl daemon-reload
 systemctl enable --now netatlas
