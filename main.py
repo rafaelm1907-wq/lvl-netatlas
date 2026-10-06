@@ -1165,8 +1165,17 @@ def rename_link(lid:int,x:LinkNameIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
   q.execute('UPDATE links SET name=%s,updated_at=now() WHERE id=%s',(x.name.strip(),lid))
   if not q.rowcount:raise HTTPException(404,'Enlace não encontrado')
-  audit(q,u,'rename_link','link',lid,x.name.strip())
+ audit(q,u,'rename_link','link',lid,x.name.strip())
  return {'status':'ok','name':x.name.strip()}
+@app.post('/api/links/{lid}/validate-route')
+def validate_link_route(lid:int,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT id,name,route_mode FROM links WHERE id=%s FOR UPDATE',(lid,));link=q.fetchone()
+  if not link:raise HTTPException(404,'Enlace não encontrado')
+  if link['route_mode']!='suggested':raise HTTPException(422,'Este enlace não possui um trajeto sugerido pendente de validação')
+  q.execute("UPDATE links SET route_mode='manual',updated_at=now() WHERE id=%s",(lid,))
+  audit(q,u,'validate_link_route','link',lid,link['name'],{'previous_route_mode':'suggested','route_mode':'manual'})
+ return {'status':'ok','route_mode':'manual'}
 @app.patch('/api/links/{lid}/interface/{side}')
 def replace_link_interface(lid:int,side:str,x:LinkInterfaceIn,u=Depends(operator)):
  if side not in ('source','target'):raise HTTPException(422,'Ponta do enlace inválida')
