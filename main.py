@@ -50,7 +50,7 @@ class RouteSuggestionIn(BaseModel):
  source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
 class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); password:str=Field(min_length=1,max_length=200)
 class IssueIn(BaseModel):
- target_kind:str=Field(pattern='^(device|node|link)$'); target_id:int; target_name:str=Field(min_length=1,max_length=200); severity:str=Field(pattern='^(medium|severe|disaster)$'); description:str=Field(min_length=1,max_length=1000)
+ target_kind:str=Field(pattern='^(device|node|link)$'); target_id:int; target_name:str=Field(min_length=1,max_length=200); severity:str=Field(pattern='^(medium|severe|disaster)$'); description:str=Field(min_length=1,max_length=1000); latitude:float|None=Field(default=None,ge=-90,le=90); longitude:float|None=Field(default=None,ge=-180,le=180)
 class UserIn(BaseModel):
  username:str=Field(min_length=3,max_length=80); display_name:str=Field(min_length=1,max_length=120); password:str=Field(min_length=8,max_length=200); role:str=Field(pattern='^(superadmin|admin|technician)$')
 class LicenseActivateIn(BaseModel):
@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute("ALTER TABLE bgp_operator_interfaces ADD COLUMN IF NOT EXISTS subtitle TEXT")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_name TEXT')
+  q.execute('ALTER TABLE issues ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;ALTER TABLE issues ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
@@ -1185,11 +1186,13 @@ def delete_link(lid:int,u=Depends(superadmin)):
 def list_issues(status:str|None=None,u=Depends(viewer)):
  where='WHERE i.status=%s' if status else '';args=(status,) if status else ()
  with pg() as c,c.cursor() as q:
-  q.execute(f"""SELECT i.id,i.target_kind,i.target_id,i.target_name,i.severity,i.description,i.status,i.created_at,i.validated_at,i.resolved_at,ru.display_name reported_by_name,vu.display_name validated_by_name FROM issues i JOIN users ru ON ru.id=i.reported_by LEFT JOIN users vu ON vu.id=i.validated_by {where} ORDER BY CASE i.status WHEN 'pending' THEN 0 WHEN 'validated' THEN 1 ELSE 2 END,i.created_at DESC""",args);return q.fetchall()
+  q.execute(f"""SELECT i.id,i.target_kind,i.target_id,i.target_name,i.severity,i.description,i.status,i.latitude,i.longitude,i.created_at,i.validated_at,i.resolved_at,ru.display_name reported_by_name,vu.display_name validated_by_name FROM issues i JOIN users ru ON ru.id=i.reported_by LEFT JOIN users vu ON vu.id=i.validated_by {where} ORDER BY CASE i.status WHEN 'pending' THEN 0 WHEN 'validated' THEN 1 ELSE 2 END,i.created_at DESC""",args);return q.fetchall()
 @app.post('/api/issues',status_code=201)
 def report_issue(x:IssueIn,u=Depends(viewer)):
+ if (x.latitude is None)!=(x.longitude is None):raise HTTPException(422,'Informe latitude e longitude juntas')
+ if x.target_kind=='link' and x.latitude is None:raise HTTPException(422,'Clique no ponto exato do enlace antes de reportar o erro')
  status='validated' if u['role'] in ('admin','superadmin') else 'pending';validated_by=u['id'] if status=='validated' else None;validated_at=datetime.now(timezone.utc) if status=='validated' else None
- with pg() as c,c.cursor() as q:q.execute("""INSERT INTO issues(target_kind,target_id,target_name,severity,description,status,reported_by,validated_by,validated_at)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)RETURNING id""",(x.target_kind,x.target_id,x.target_name,x.severity,x.description,status,u['id'],validated_by,validated_at));iid=q.fetchone()['id'];audit(q,u,'report_issue','issue',iid,x.target_name,{'target_kind':x.target_kind,'target_id':x.target_id,'severity':x.severity,'status':status});return {'id':iid,'status':status}
+ with pg() as c,c.cursor() as q:q.execute("""INSERT INTO issues(target_kind,target_id,target_name,severity,description,status,reported_by,validated_by,validated_at,latitude,longitude)VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)RETURNING id""",(x.target_kind,x.target_id,x.target_name,x.severity,x.description,status,u['id'],validated_by,validated_at,x.latitude,x.longitude));iid=q.fetchone()['id'];audit(q,u,'report_issue','issue',iid,x.target_name,{'target_kind':x.target_kind,'target_id':x.target_id,'severity':x.severity,'status':status,'latitude':x.latitude,'longitude':x.longitude});return {'id':iid,'status':status}
 @app.post('/api/issues/{issue_id}/validate')
 def validate_issue(issue_id:int,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
