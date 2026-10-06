@@ -53,6 +53,8 @@ class IssueIn(BaseModel):
  target_kind:str=Field(pattern='^(device|node|link)$'); target_id:int; target_name:str=Field(min_length=1,max_length=200); severity:str=Field(pattern='^(medium|severe|disaster)$'); description:str=Field(min_length=1,max_length=1000); latitude:float|None=Field(default=None,ge=-90,le=90); longitude:float|None=Field(default=None,ge=-180,le=180)
 class UserIn(BaseModel):
  username:str=Field(min_length=3,max_length=80); display_name:str=Field(min_length=1,max_length=120); password:str=Field(min_length=8,max_length=200); role:str=Field(pattern='^(superadmin|admin|technician)$')
+class UserUpdateIn(BaseModel):
+ display_name:str|None=Field(default=None,min_length=1,max_length=120); password:str|None=Field(default=None,min_length=8,max_length=200); role:str|None=Field(default=None,pattern='^(superadmin|admin|technician)$'); active:bool|None=None
 class LicenseActivateIn(BaseModel):
  license_key:str=Field(min_length=8,max_length=300)
 class BgpFeatureIn(BaseModel):
@@ -364,6 +366,23 @@ def create_user(x:UserIn,u=Depends(superadmin)):
  try:
   with pg() as c,c.cursor() as q:q.execute('INSERT INTO users(username,display_name,role,password_salt,password_hash)VALUES(%s,%s,%s,%s,%s)RETURNING id',(x.username.lower(),x.display_name,x.role,salt,digest));uid=q.fetchone()['id'];audit(q,u,'create_user','user',uid,x.username.lower(),{'role':x.role,'display_name':x.display_name});return {'id':uid}
  except psycopg.errors.UniqueViolation:raise HTTPException(409,'Este usuário já existe')
+@app.patch('/api/users/{user_id}')
+def update_user(user_id:int,x:UserUpdateIn,u=Depends(superadmin)):
+ if user_id==u['id'] and x.active is False:raise HTTPException(422,'Você não pode desativar seu próprio usuário')
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT id,username,display_name,role,active FROM users WHERE id=%s FOR UPDATE',(user_id,));current=q.fetchone()
+  if not current:raise HTTPException(404,'Usuário não encontrado')
+  new_role=x.role or current['role'];new_active=current['active'] if x.active is None else x.active
+  if current['role']=='superadmin' and (new_role!='superadmin' or not new_active):
+   q.execute("SELECT count(*) n FROM users WHERE role='superadmin' AND active AND id<>%s",(user_id,))
+   if q.fetchone()['n']==0:raise HTTPException(422,'É necessário manter pelo menos um Superadmin ativo')
+  display_name=x.display_name or current['display_name'];fields=['display_name=%s','role=%s','active=%s','updated_at=now()'];values=[display_name,new_role,new_active]
+  if x.password:
+   salt,digest=password_hash(x.password);fields+=['password_salt=%s','password_hash=%s'];values+=[salt,digest]
+  values.append(user_id);q.execute(f"UPDATE users SET {','.join(fields)} WHERE id=%s",values)
+  if not new_active:q.execute('DELETE FROM sessions WHERE user_id=%s',(user_id,))
+  audit(q,u,'update_user','user',user_id,current['username'],{'display_name':display_name,'role':new_role,'active':new_active,'password_reset':bool(x.password)})
+ return {'id':user_id,'display_name':display_name,'role':new_role,'active':new_active}
 @app.get('/api/audit')
 def audit_events(limit:int=200,u=Depends(superadmin)):
  limit=max(1,min(limit,500))
