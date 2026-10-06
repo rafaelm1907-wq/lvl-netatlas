@@ -23,7 +23,7 @@ GITHUB_REPOSITORY=os.getenv('NETATLAS_GITHUB_REPOSITORY','rafaelm1907-wq/lvl-net
 INSTALL_DIR='/opt/netatlas'
 
 class NodeIn(BaseModel):
- name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None; splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$"); splitter_name:str|None=Field(default=None,max_length=120)
+ name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud|dedicated)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None; splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$"); splitter_name:str|None=Field(default=None,max_length=120)
 class PopIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180)
 class PositionIn(BaseModel):
@@ -263,7 +263,7 @@ def netbox_site(site_id):
  if site.get('latitude') is None or site.get('longitude') is None:raise RuntimeError('O POP selecionado não possui coordenadas')
  return site
 def sync_node_to_netbox(node,site_id=None):
- labels={'cto':('CTO','cto','CTO'),'host':('Host planejado','host-planejado','Host Planejado'),'junction':('Elemento de rede','elemento-rede','Elemento de Rede'),'cloud':('Operadora','operadora','Operadora / Nuvem')};role_name,role_slug,model=labels.get(node['kind'],labels['junction'])
+ labels={'cto':('CTO','cto','CTO'),'host':('Host planejado','host-planejado','Host Planejado'),'junction':('Elemento de rede','elemento-rede','Elemento de Rede'),'cloud':('Operadora','operadora','Operadora / Nuvem'),'dedicated':('Cliente dedicado','cliente-dedicado','Cliente Dedicado')};role_name,role_slug,model=labels.get(node['kind'],labels['junction'])
  manufacturer=nbensure('/api/dcim/manufacturers/','netatlas',{'name':'NetAtlas','slug':'netatlas','description':'Elementos cadastrados e sincronizados pelo LVL - NetAtlas'})
  role=nbensure('/api/dcim/device-roles/',role_slug,{'name':role_name,'slug':role_slug,'color':'2196f3','vm_role':False,'description':'Gerenciado pelo LVL - NetAtlas'})
  dtype_slug=f'netatlas-{role_slug}';dtype=nbensure('/api/dcim/device-types/',dtype_slug,{'manufacturer':manufacturer['id'],'model':model,'slug':dtype_slug,'u_height':0,'is_full_depth':False})
@@ -970,16 +970,16 @@ def delete_node(node_id:int,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
   q.execute('SELECT id,name,kind,netbox_device_id FROM nodes WHERE id=%s',(node_id,));node=q.fetchone()
   if not node:raise HTTPException(404,'Elemento não encontrado')
-  if node['kind']!='cto':raise HTTPException(422,'Esta operação de exclusão está disponível somente para CTOs')
+  if node['kind'] not in ('cto','dedicated'):raise HTTPException(422,'Esta operação de exclusão está disponível somente para CTOs e clientes dedicados')
   if node['netbox_device_id']:
    try:nbrequest('DELETE',f"/api/dcim/devices/{node['netbox_device_id']}/")
    except httpx.HTTPStatusError as e:
-    if e.response.status_code!=404:raise HTTPException(502,f'Não foi possível excluir a CTO no NetBox: {e}')
+    if e.response.status_code!=404:raise HTTPException(502,f'Não foi possível excluir o elemento no NetBox: {e}')
   q.execute("SELECT id FROM links WHERE (source_kind='node' AND source_id=%s) OR (target_kind='node' AND target_id=%s)",(node_id,node_id));link_ids=[r['id'] for r in q.fetchall()]
   if link_ids:q.execute("DELETE FROM issues WHERE target_kind='link' AND target_id=ANY(%s)",(link_ids,))
   q.execute("DELETE FROM issues WHERE target_kind='node' AND target_id=%s",(node_id,))
   q.execute("DELETE FROM links WHERE (source_kind='node' AND source_id=%s) OR (target_kind='node' AND target_id=%s)",(node_id,node_id))
-  removed_links=q.rowcount;q.execute('DELETE FROM nodes WHERE id=%s',(node_id,));audit(q,u,'delete_cto','node',node_id,node['name'],{'removed_links':removed_links,'netbox_device_id':node['netbox_device_id']})
+  removed_links=q.rowcount;q.execute('DELETE FROM nodes WHERE id=%s',(node_id,));audit(q,u,'delete_cto' if node['kind']=='cto' else 'delete_dedicated_client','node',node_id,node['name'],{'removed_links':removed_links,'netbox_device_id':node['netbox_device_id']})
  return {'status':'ok','name':node['name'],'removed_links':removed_links}
 
 @app.delete('/api/devices/{device_id}')
