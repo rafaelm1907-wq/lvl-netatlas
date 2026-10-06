@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'br.com.lvltech.netatlas'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'br.com.lvltech.netatlas'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+    }
+    signingConfigs {
+        debug {
+            storeFile file('netatlas-debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}

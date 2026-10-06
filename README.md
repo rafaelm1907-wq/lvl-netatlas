@@ -32,3 +32,9 @@ O gerenciador deve disponibilizar as rotas somente leitura `/api/integration/olt
 ## Segurança
 
 Nunca envie `.env`, `/etc/netatlas/netatlas.env`, tokens, senhas ou bancos de dados ao Git. O arquivo `.env.example` é apenas um modelo sem credenciais.
+
+## Aplicativo Android
+
+O projeto Android fica em `android/`. No primeiro acesso, o aplicativo solicita a URL completa da instalação do NetAtlas (por exemplo, `http://192.168.1.10:20050`) e guarda essa configuração no aparelho. O servidor pode ser alterado depois pelo botão de engrenagem.
+
+Abra a pasta `android` no Android Studio para compilar e gerar o APK. O WebView aceita instalações HTTP em redes privadas, mantém a sessão do usuário e oferece seleção de arquivos e acesso à localização mediante permissão.

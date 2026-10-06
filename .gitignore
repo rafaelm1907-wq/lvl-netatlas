@@ -4,3 +4,11 @@ venv/
 __pycache__/
 *.py[cod]
 .DS_Store
+.gradle/
+android/.gradle/
+android/.gradle-home/
+android/.android-home/
+android/local.properties
+android/app/build/
+android/build/
+android/app/*.keystore
