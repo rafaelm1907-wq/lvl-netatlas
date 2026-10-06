@@ -1060,11 +1060,12 @@ def links(u=Depends(viewer)):
   endpoint_states=[]
   for side in ('source','target'):
    hid=r[f'{side}_zabbix_hostid'];itemid=r[f'{side}_interface_itemid'];name=r[f'{side}_interface_name']
-   if not hid:continue
+   if not hid or (not itemid and not name):continue
    candidates=interface_cache.get(int(hid),[]);match=next((x for x in candidates if itemid and x['status_itemid'] and int(x['status_itemid'])==int(itemid)),None) or next((x for x in candidates if x['name']==name),None)
    endpoint_states.append(match['status'] if match else 'unknown')
   endpoint_values[r['id']]=endpoint_states
-  statuses[r['id']]='down' if 'down' in endpoint_states else 'up' if endpoint_states and all(v=='up' for v in endpoint_states) else 'unknown'
+  provisional=any(r[f'{side}_kind']=='device' and not r[f'{side}_interface_itemid'] and not r[f'{side}_interface_name'] for side in ('source','target'))
+  statuses[r['id']]='down' if 'down' in endpoint_states else 'up' if endpoint_states and all(v=='up' for v in endpoint_states) else 'provisional' if provisional else 'unknown'
  # CTOs são passivas: todos os trechos conectados por elas usam as interfaces
  # monitoradas existentes no caminho, sem transformar o estado em "desconhecido".
  adjacent={r['id']:set() for r in rs};by_passive={}
@@ -1088,7 +1089,7 @@ def links(u=Depends(viewer)):
     # Um enlace que possui interface monitorada tem estado próprio. A herança
     # existe somente para os trechos totalmente passivos (por exemplo, depois
     # de uma CTO), evitando que um DOWN vizinho contamine duas pontas UP.
-    if not endpoint_values[current]:statuses[current]=inherited_state
+    if not endpoint_values[current] and statuses[current]!='provisional':statuses[current]=inherited_state
  out=[]
  for r in rs:
   d=dict(r);d['geometry']=json.loads(d['geometry']);d['status']=statuses[r['id']];d['passive_nodes']=passive_by_link.get(r['id'],[]);d['created_at']=d['created_at'].isoformat();d['updated_at']=d['updated_at'].isoformat();out.append(d)
