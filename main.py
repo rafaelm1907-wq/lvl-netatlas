@@ -46,6 +46,7 @@ class ZabbixHostImportIn(BaseModel):
 class ZabbixHostsImportIn(BaseModel):
  hostids:list[int]=Field(min_length=1,max_length=100); site_id:int
 class ValidateProvisionalHostIn(BaseModel): hostid:int
+class DedicatedZabbixIn(BaseModel): hostid:int|None=None
 class RouteSuggestionIn(BaseModel):
  source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
 class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); password:str=Field(min_length=1,max_length=200)
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute("ALTER TABLE bgp_operator_interfaces ADD COLUMN IF NOT EXISTS subtitle TEXT")
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_device_id BIGINT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS netbox_sync_error TEXT')
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_name TEXT')
+  q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS dedicated_zabbix_hostid BIGINT')
   q.execute('ALTER TABLE issues ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;ALTER TABLE issues ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION')
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
@@ -925,8 +927,8 @@ WHERE a.geom IS NOT NULL ORDER BY n.name,o.output_number,a.ont_number""");rows=q
 def sync_alert_acknowledgements(x:AlertAckSyncIn,u=Depends(viewer)):
  active=list(dict.fromkeys(key for key in x.active_keys if key and len(key)<=200))
  with pg() as c,c.cursor() as q:
-  if active:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND alert_key LIKE 'link:%%' AND NOT (alert_key=ANY(%s))",(u['id'],active))
-  else:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND alert_key LIKE 'link:%%'",(u['id'],))
+  if active:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND (alert_key LIKE 'link:%%' OR alert_key LIKE 'dedicated:%%') AND NOT (alert_key=ANY(%s))",(u['id'],active))
+  else:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND (alert_key LIKE 'link:%%' OR alert_key LIKE 'dedicated:%%')",(u['id'],))
   q.execute('SELECT alert_key FROM notification_acknowledgements WHERE user_id=%s AND alert_key=ANY(%s)',(u['id'],active or ['']));acks=[row['alert_key'] for row in q.fetchall()]
  return {'acknowledged':acks}
 
@@ -947,7 +949,45 @@ WHERE a.id=%s AND o.id=a.output_id AND s.id=o.splitter_id AND n.id=s.node_id RET
 
 @app.get('/api/nodes')
 def nodes(u=Depends(viewer)):
- with pg() as c,c.cursor() as q:q.execute('SELECT id,name,kind,ST_Y(geom) latitude,ST_X(geom) longitude,netbox_device_id,netbox_sync_error,splitter_type,splitter_name FROM nodes ORDER BY name');return q.fetchall()
+ with pg() as c,c.cursor() as q:q.execute('SELECT id,name,kind,ST_Y(geom) latitude,ST_X(geom) longitude,netbox_device_id,netbox_sync_error,splitter_type,splitter_name,dedicated_zabbix_hostid FROM nodes ORDER BY name');return q.fetchall()
+
+@app.patch('/api/nodes/{node_id}/dedicated-zabbix')
+def set_dedicated_zabbix(node_id:int,x:DedicatedZabbixIn,u=Depends(operator)):
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT id,name,kind,dedicated_zabbix_hostid FROM nodes WHERE id=%s',(node_id,));node=q.fetchone()
+  if not node:raise HTTPException(404,'Cliente dedicado não encontrado')
+  if node['kind']!='dedicated':raise HTTPException(422,'A associação ao Zabbix é exclusiva para clientes dedicados')
+  host_name=None
+  if x.hostid is not None:
+   try:
+    with closing(zconn()) as zc,zc.cursor() as z:z.execute('SELECT hostid,name,host FROM hosts WHERE hostid=%s AND flags=0',(x.hostid,));host=z.fetchone()
+   except Exception as e:raise HTTPException(502,f'Falha ao consultar o host no Zabbix: {e}')
+   if not host:raise HTTPException(404,'Host não encontrado no Zabbix')
+   host_name=host.get('name') or host.get('host')
+  q.execute('UPDATE nodes SET dedicated_zabbix_hostid=%s,updated_at=now() WHERE id=%s',(x.hostid,node_id))
+  audit(q,u,'associate_dedicated_zabbix' if x.hostid is not None else 'remove_dedicated_zabbix','node',node_id,node['name'],{'old_hostid':node['dedicated_zabbix_hostid'],'hostid':x.hostid,'host_name':host_name})
+ return {'status':'ok','node_id':node_id,'zabbix_hostid':x.hostid,'zabbix_name':host_name}
+
+@app.get('/api/dedicated-customers/metrics')
+def dedicated_customer_metrics(u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:q.execute("SELECT id,dedicated_zabbix_hostid FROM nodes WHERE kind='dedicated' AND dedicated_zabbix_hostid IS NOT NULL");nodes=q.fetchall()
+ if not nodes:return []
+ host_ids=sorted({int(n['dedicated_zabbix_hostid']) for n in nodes});marks=','.join(['%s']*len(host_ids))
+ try:
+  with closing(zconn()) as c,c.cursor() as q:
+   q.execute(f"SELECT h.hostid,h.name host_name,i.itemid,i.key_ FROM hosts h LEFT JOIN items i ON i.hostid=h.hostid AND i.status=0 AND (i.key_='icmpping' OR i.key_ LIKE 'icmpping[%%]' OR i.key_='icmppingloss' OR i.key_ LIKE 'icmppingloss[%%]' OR i.key_='icmppingsec' OR i.key_ LIKE 'icmppingsec[%%]') WHERE h.hostid IN ({marks}) ORDER BY h.hostid,i.itemid",host_ids);rows=q.fetchall()
+  values=latest_numeric([int(r['itemid']) for r in rows if r.get('itemid')])
+ except Exception as e:raise HTTPException(502,f'Falha ao consultar ICMP no Zabbix: {e}')
+ by_host={}
+ for row in rows:
+  host=by_host.setdefault(int(row['hostid']),{'zabbix_hostid':int(row['hostid']),'zabbix_name':row['host_name'],'ping_status':'unknown','ping_value':None,'loss_percent':None,'response_time_ms':None,'collected_at':None})
+  sample=values.get(int(row['itemid'])) if row.get('itemid') else None
+  if not sample:continue
+  key=row['key_'].split('[',1)[0];host['collected_at']=max(host['collected_at'] or 0,sample['clock'])
+  if key=='icmpping':host['ping_value']=int(sample['value']);host['ping_status']='up' if int(sample['value'])==1 else 'down'
+  elif key=='icmppingloss':host['loss_percent']=sample['value']
+  elif key=='icmppingsec':host['response_time_ms']=sample['value']*1000
+ return [dict(by_host.get(int(n['dedicated_zabbix_hostid']),{'zabbix_hostid':int(n['dedicated_zabbix_hostid']),'ping_status':'unknown'}),node_id=n['id']) for n in nodes]
 @app.post('/api/nodes',status_code=201)
 def create_node(n:NodeIn,u=Depends(operator)):
  with pg() as c,c.cursor() as q:
