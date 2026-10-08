@@ -53,9 +53,9 @@ class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); passwo
 class IssueIn(BaseModel):
  target_kind:str=Field(pattern='^(device|node|link)$'); target_id:int; target_name:str=Field(min_length=1,max_length=200); severity:str=Field(pattern='^(medium|severe|disaster)$'); description:str=Field(min_length=1,max_length=1000); latitude:float|None=Field(default=None,ge=-90,le=90); longitude:float|None=Field(default=None,ge=-180,le=180)
 class UserIn(BaseModel):
- username:str=Field(min_length=3,max_length=80); display_name:str=Field(min_length=1,max_length=120); password:str=Field(min_length=8,max_length=200); role:str=Field(pattern='^(superadmin|admin|technician)$')
+ username:str=Field(min_length=3,max_length=80); display_name:str=Field(min_length=1,max_length=120); password:str=Field(min_length=8,max_length=200); role:str=Field(pattern='^(superadmin|admin|technician|viewer)$')
 class UserUpdateIn(BaseModel):
- display_name:str|None=Field(default=None,min_length=1,max_length=120); password:str|None=Field(default=None,min_length=8,max_length=200); role:str|None=Field(default=None,pattern='^(superadmin|admin|technician)$'); active:bool|None=None
+ display_name:str|None=Field(default=None,min_length=1,max_length=120); password:str|None=Field(default=None,min_length=8,max_length=200); role:str|None=Field(default=None,pattern='^(superadmin|admin|technician|viewer)$'); active:bool|None=None
 class LicenseActivateIn(BaseModel):
  license_key:str=Field(min_length=8,max_length=300)
 class BgpFeatureIn(BaseModel):
@@ -129,7 +129,7 @@ def roles(*allowed):
   if u['role'] not in allowed:raise HTTPException(403,'Seu perfil não permite esta ação')
   return u
  return check
-viewer=roles('superadmin','admin','technician');operator=roles('superadmin','admin');superadmin=roles('superadmin')
+viewer=roles('superadmin','admin','technician','viewer');reporter=roles('superadmin','admin','technician');operator=roles('superadmin','admin');user_manager=roles('superadmin','admin');superadmin=roles('superadmin')
 
 @app.on_event("startup")
 def startup():
@@ -137,8 +137,8 @@ def startup():
   # Os workers do bootstrap em paralelo; o lock evita DDL concorrente e deadlocks.
   q.execute('SELECT pg_advisory_xact_lock(748215005)')
   q.execute("""CREATE TABLE IF NOT EXISTS nodes(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'cto',geom geometry(Point,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE TABLE IF NOT EXISTS element_positions(element_kind TEXT NOT NULL,element_id BIGINT NOT NULL,geom geometry(Point,4326) NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(element_kind,element_id));CREATE TABLE IF NOT EXISTS links(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,source_kind TEXT NOT NULL,source_id BIGINT NOT NULL,source_name TEXT NOT NULL,source_zabbix_hostid BIGINT,source_interface_itemid BIGINT,source_interface_name TEXT,source_interface_description TEXT,target_kind TEXT NOT NULL,target_id BIGINT NOT NULL,target_name TEXT NOT NULL,target_zabbix_hostid BIGINT,target_interface_itemid BIGINT,target_interface_name TEXT,target_interface_description TEXT,parent_link_id BIGINT REFERENCES links(id) ON DELETE SET NULL,geom geometry(LineString,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS links_geom_gix ON links USING GIST(geom);CREATE INDEX IF NOT EXISTS nodes_geom_gix ON nodes USING GIST(geom);
-CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,username TEXT NOT NULL UNIQUE,display_name TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('superadmin','admin','technician')),password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,username TEXT NOT NULL UNIQUE,display_name TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('superadmin','admin','technician','viewer')),password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),remote_addr TEXT,user_agent TEXT);
 CREATE TABLE IF NOT EXISTS issues(id BIGSERIAL PRIMARY KEY,target_kind TEXT NOT NULL CHECK(target_kind IN('device','node','link')),target_id BIGINT NOT NULL,target_name TEXT NOT NULL,severity TEXT NOT NULL CHECK(severity IN('medium','severe','disaster')),description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','validated','resolved')),reported_by BIGINT NOT NULL REFERENCES users(id),validated_by BIGINT REFERENCES users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),validated_at TIMESTAMPTZ,resolved_at TIMESTAMPTZ);CREATE INDEX IF NOT EXISTS issues_target_idx ON issues(target_kind,target_id,status);
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL,actor_role TEXT NOT NULL,action TEXT NOT NULL,target_kind TEXT NOT NULL,target_id BIGINT,target_name TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC)""")
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
@@ -155,6 +155,9 @@ CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT RE
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_type TEXT;ALTER TABLE nodes ADD COLUMN IF NOT EXISTS splitter_name TEXT')
   q.execute('ALTER TABLE nodes ADD COLUMN IF NOT EXISTS dedicated_zabbix_hostid BIGINT')
   q.execute('ALTER TABLE issues ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;ALTER TABLE issues ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION')
+  q.execute("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;ALTER TABLE users ADD CONSTRAINT users_role_check CHECK(role IN('superadmin','admin','technician','viewer'));ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by BIGINT REFERENCES users(id) ON DELETE SET NULL")
+  q.execute('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS remote_addr TEXT;ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT')
+  q.execute("DELETE FROM sessions s USING(SELECT s2.token_hash,row_number()OVER(PARTITION BY s2.user_id ORDER BY s2.created_at DESC) rn FROM sessions s2 JOIN users u ON u.id=s2.user_id WHERE u.role<>'superadmin') ranked WHERE s.token_hash=ranked.token_hash AND ranked.rn>1")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS route_mode TEXT NOT NULL DEFAULT 'manual'")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS source_splitter_type TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS target_splitter_type TEXT")
   q.execute("ALTER TABLE links ADD COLUMN IF NOT EXISTS trunk_group TEXT;ALTER TABLE links ADD COLUMN IF NOT EXISTS is_trunk BOOLEAN NOT NULL DEFAULT false;CREATE INDEX IF NOT EXISTS links_trunk_group_idx ON links(trunk_group)")
@@ -344,11 +347,13 @@ def zstates(ids):
  with closing(zconn()) as c,c.cursor() as q:q.execute(sql,ids);return {int(r['hostid']):r for r in q.fetchall()}
 
 @app.post('/api/auth/login')
-def login(x:LoginIn,response:Response):
+def login(x:LoginIn,response:Response,request:Request):
  with pg() as c,c.cursor() as q:
-  q.execute('SELECT id,username,display_name,role,password_salt,password_hash,active FROM users WHERE lower(username)=lower(%s)',(x.username,));u=q.fetchone()
+  q.execute('SELECT id,username,display_name,role,password_salt,password_hash,active FROM users WHERE lower(username)=lower(%s) FOR UPDATE',(x.username,));u=q.fetchone()
   if not u or not u['active'] or not verify_password(x.password,u['password_salt'],u['password_hash']):raise HTTPException(401,'Usuário ou senha inválidos')
-  token=secrets.token_urlsafe(48);q.execute('DELETE FROM sessions WHERE expires_at<=now()');q.execute('INSERT INTO sessions(token_hash,user_id,expires_at)VALUES(%s,%s,%s)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],datetime.now(timezone.utc)+timedelta(hours=12)))
+  token=secrets.token_urlsafe(48);q.execute('DELETE FROM sessions WHERE expires_at<=now()')
+  if u['role']!='superadmin':q.execute('DELETE FROM sessions WHERE user_id=%s',(u['id'],))
+  q.execute('INSERT INTO sessions(token_hash,user_id,expires_at,remote_addr,user_agent)VALUES(%s,%s,%s,%s,%s)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],datetime.now(timezone.utc)+timedelta(hours=12),request.client.host if request.client else None,(request.headers.get('user-agent') or '')[:500]))
  response.set_cookie('netatlas_session',token,httponly=True,samesite='strict',secure=False,max_age=43200,path='/')
  return {k:u[k] for k in ('id','username','display_name','role')}
 @app.post('/api/auth/logout',status_code=204)
@@ -360,31 +365,50 @@ def logout(request:Request,response:Response):
 @app.get('/api/auth/me')
 def me(u=Depends(viewer)):return u
 @app.get('/api/users')
-def users(u=Depends(superadmin)):
- with pg() as c,c.cursor() as q:q.execute('SELECT id,username,display_name,role,active,created_at FROM users ORDER BY username');return q.fetchall()
+def users(u=Depends(user_manager)):
+ with pg() as c,c.cursor() as q:
+  if u['role']=='superadmin':q.execute('SELECT id,username,display_name,role,active,created_at,created_by FROM users ORDER BY username')
+  else:q.execute("SELECT id,username,display_name,role,active,created_at,created_by FROM users WHERE created_by=%s AND role IN('technician','viewer') ORDER BY username",(u['id'],))
+  return q.fetchall()
 @app.post('/api/users',status_code=201)
-def create_user(x:UserIn,u=Depends(superadmin)):
+def create_user(x:UserIn,u=Depends(user_manager)):
+ if u['role']=='admin' and x.role not in ('technician','viewer'):raise HTTPException(403,'Admin pode criar somente usuários Técnico ou Visualização')
  salt,digest=password_hash(x.password)
  try:
-  with pg() as c,c.cursor() as q:q.execute('INSERT INTO users(username,display_name,role,password_salt,password_hash)VALUES(%s,%s,%s,%s,%s)RETURNING id',(x.username.lower(),x.display_name,x.role,salt,digest));uid=q.fetchone()['id'];audit(q,u,'create_user','user',uid,x.username.lower(),{'role':x.role,'display_name':x.display_name});return {'id':uid}
+  with pg() as c,c.cursor() as q:
+   if u['role']=='admin':
+    limit=3 if x.role=='technician' else 2;q.execute('SELECT count(*) n FROM users WHERE created_by=%s AND role=%s',(u['id'],x.role))
+    if q.fetchone()['n']>=limit:raise HTTPException(422,f'Limite de {limit} usuários {"Técnico" if x.role=="technician" else "Visualização"} ativos atingido')
+   q.execute('INSERT INTO users(username,display_name,role,password_salt,password_hash,created_by)VALUES(%s,%s,%s,%s,%s,%s)RETURNING id',(x.username.lower(),x.display_name,x.role,salt,digest,u['id'] if u['role']=='admin' else None));uid=q.fetchone()['id'];audit(q,u,'create_user','user',uid,x.username.lower(),{'role':x.role,'display_name':x.display_name});return {'id':uid}
  except psycopg.errors.UniqueViolation:raise HTTPException(409,'Este usuário já existe')
 @app.patch('/api/users/{user_id}')
-def update_user(user_id:int,x:UserUpdateIn,u=Depends(superadmin)):
+def update_user(user_id:int,x:UserUpdateIn,u=Depends(user_manager)):
  if user_id==u['id'] and x.active is False:raise HTTPException(422,'Você não pode desativar seu próprio usuário')
  with pg() as c,c.cursor() as q:
-  q.execute('SELECT id,username,display_name,role,active FROM users WHERE id=%s FOR UPDATE',(user_id,));current=q.fetchone()
+  q.execute('SELECT id,username,display_name,role,active,created_by FROM users WHERE id=%s FOR UPDATE',(user_id,));current=q.fetchone()
   if not current:raise HTTPException(404,'Usuário não encontrado')
+  if u['role']=='admin' and (current['created_by']!=u['id'] or current['role'] not in ('technician','viewer')):raise HTTPException(403,'Você só pode gerenciar usuários criados por você')
   new_role=x.role or current['role'];new_active=current['active'] if x.active is None else x.active
+  if u['role']=='admin' and new_role not in ('technician','viewer'):raise HTTPException(403,'Admin pode atribuir somente os perfis Técnico ou Visualização')
   if current['role']=='superadmin' and (new_role!='superadmin' or not new_active):
    q.execute("SELECT count(*) n FROM users WHERE role='superadmin' AND active AND id<>%s",(user_id,))
    if q.fetchone()['n']==0:raise HTTPException(422,'É necessário manter pelo menos um Superadmin ativo')
+  if u['role']=='admin' and new_role!=current['role']:
+   limit=3 if new_role=='technician' else 2;q.execute('SELECT count(*) n FROM users WHERE created_by=%s AND role=%s AND id<>%s',(u['id'],new_role,user_id))
+   if q.fetchone()['n']>=limit:raise HTTPException(422,f'Limite de {limit} usuários {"Técnico" if new_role=="technician" else "Visualização"} ativos atingido')
   display_name=x.display_name or current['display_name'];fields=['display_name=%s','role=%s','active=%s','updated_at=now()'];values=[display_name,new_role,new_active]
   if x.password:
    salt,digest=password_hash(x.password);fields+=['password_salt=%s','password_hash=%s'];values+=[salt,digest]
   values.append(user_id);q.execute(f"UPDATE users SET {','.join(fields)} WHERE id=%s",values)
-  if not new_active:q.execute('DELETE FROM sessions WHERE user_id=%s',(user_id,))
+  if not new_active or x.password:q.execute('DELETE FROM sessions WHERE user_id=%s',(user_id,))
   audit(q,u,'update_user','user',user_id,current['username'],{'display_name':display_name,'role':new_role,'active':new_active,'password_reset':bool(x.password)})
  return {'id':user_id,'display_name':display_name,'role':new_role,'active':new_active}
+@app.get('/api/sessions')
+def active_sessions(u=Depends(superadmin)):
+ with pg() as c,c.cursor() as q:
+  q.execute('DELETE FROM sessions WHERE expires_at<=now()')
+  q.execute('SELECT u.id user_id,u.username,u.display_name,u.role,s.created_at,s.expires_at,s.remote_addr,s.user_agent FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.active ORDER BY s.created_at DESC')
+  return q.fetchall()
 @app.get('/api/audit')
 def audit_events(limit:int=200,u=Depends(superadmin)):
  limit=max(1,min(limit,500))
@@ -924,7 +948,7 @@ WHERE a.geom IS NOT NULL ORDER BY n.name,o.output_number,a.ont_number""");rows=q
  return [{**dict(row),'olt_name':olt_names.get(str(row['olt_id']),str(row['olt_id'])),'last_collected_at':row['last_collected_at'].isoformat() if row['last_collected_at'] else None} for row in rows]
 
 @app.post('/api/alert-acknowledgements/sync')
-def sync_alert_acknowledgements(x:AlertAckSyncIn,u=Depends(viewer)):
+def sync_alert_acknowledgements(x:AlertAckSyncIn,u=Depends(reporter)):
  active=list(dict.fromkeys(key for key in x.active_keys if key and len(key)<=200))
  with pg() as c,c.cursor() as q:
   if active:q.execute("DELETE FROM notification_acknowledgements WHERE user_id=%s AND (alert_key LIKE 'link:%%' OR alert_key LIKE 'dedicated:%%') AND NOT (alert_key=ANY(%s))",(u['id'],active))
@@ -933,7 +957,7 @@ def sync_alert_acknowledgements(x:AlertAckSyncIn,u=Depends(viewer)):
  return {'acknowledged':acks}
 
 @app.post('/api/alert-acknowledgements')
-def acknowledge_alert(x:AlertAckIn,u=Depends(viewer)):
+def acknowledge_alert(x:AlertAckIn,u=Depends(reporter)):
  with pg() as c,c.cursor() as q:
   q.execute('INSERT INTO notification_acknowledgements(user_id,alert_key)VALUES(%s,%s) ON CONFLICT(user_id,alert_key)DO UPDATE SET acknowledged_at=now()',(u['id'],x.alert_key));audit(q,u,'acknowledge_alert','notification',None,x.alert_key)
  return {'status':'acknowledged'}
@@ -1257,7 +1281,7 @@ def list_issues(status:str|None=None,u=Depends(viewer)):
  with pg() as c,c.cursor() as q:
   q.execute(f"""SELECT i.id,i.target_kind,i.target_id,i.target_name,i.severity,i.description,i.status,i.latitude,i.longitude,i.created_at,i.validated_at,i.resolved_at,ru.display_name reported_by_name,vu.display_name validated_by_name FROM issues i JOIN users ru ON ru.id=i.reported_by LEFT JOIN users vu ON vu.id=i.validated_by {where} ORDER BY CASE i.status WHEN 'pending' THEN 0 WHEN 'validated' THEN 1 ELSE 2 END,i.created_at DESC""",args);return q.fetchall()
 @app.post('/api/issues',status_code=201)
-def report_issue(x:IssueIn,u=Depends(viewer)):
+def report_issue(x:IssueIn,u=Depends(reporter)):
  if (x.latitude is None)!=(x.longitude is None):raise HTTPException(422,'Informe latitude e longitude juntas')
  if x.target_kind=='link' and x.latitude is None:raise HTTPException(422,'Clique no ponto exato do enlace antes de reportar o erro')
  status='validated' if u['role'] in ('admin','superadmin') else 'pending';validated_by=u['id'] if status=='validated' else None;validated_at=datetime.now(timezone.utc) if status=='validated' else None
