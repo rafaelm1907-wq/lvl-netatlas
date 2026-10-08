@@ -1,14 +1,19 @@
-import hashlib, hmac, ipaddress, json, math, os, re, secrets, socket, subprocess, time, unicodedata
+import hashlib, hmac, ipaddress, json, logging, math, os, re, secrets, socket, subprocess, time, unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import httpx, psycopg, pymysql
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 app=FastAPI(title="LVL - NetAtlas",version="0.2.0")
+logger=logging.getLogger('netatlas')
+@app.exception_handler(Exception)
+async def unhandled_error(request:Request,exc:Exception):
+ logger.exception('Unhandled application error on %s %s',request.method,request.url.path)
+ return JSONResponse(status_code=500,content={'detail':'Ocorreu um erro interno. Consulte os logs do servidor.'})
 app.mount("/static",StaticFiles(directory="/opt/netatlas/static"),name="static")
 NETBOX_URL=os.getenv("NETBOX_URL","").rstrip("/"); NETBOX_TOKEN=os.getenv("NETBOX_TOKEN","")
 OSRM_URL=os.getenv("OSRM_URL","https://router.project-osrm.org").rstrip("/")
@@ -21,6 +26,10 @@ OLT_MANAGER_URL=os.getenv("OLT_MANAGER_URL","http://172.16.210.51:6000").rstrip(
 OLT_MANAGER_TOKEN=os.getenv("OLT_MANAGER_TOKEN","")
 GITHUB_REPOSITORY=os.getenv('NETATLAS_GITHUB_REPOSITORY','rafaelm1907-wq/lvl-netatlas').strip('/')
 INSTALL_DIR='/opt/netatlas'
+SESSION_HOURS=12
+VIEWER_SESSION_DAYS=7
+LOGIN_MAX_FAILURES=5
+LOGIN_LOCK_MINUTES=15
 
 class NodeIn(BaseModel):
  name:str=Field(min_length=1,max_length=200); kind:str=Field(default="cto",pattern="^(cto|host|junction|cloud|dedicated)$"); latitude:float=Field(ge=-90,le=90); longitude:float=Field(ge=-180,le=180); site_id:int|None=None; splitter_type:str|None=Field(default=None,pattern="^1x(2|4|8|16|32)$"); splitter_name:str|None=Field(default=None,max_length=120)
@@ -139,6 +148,7 @@ def startup():
   q.execute("""CREATE TABLE IF NOT EXISTS nodes(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL DEFAULT 'cto',geom geometry(Point,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE TABLE IF NOT EXISTS element_positions(element_kind TEXT NOT NULL,element_id BIGINT NOT NULL,geom geometry(Point,4326) NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(element_kind,element_id));CREATE TABLE IF NOT EXISTS links(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,source_kind TEXT NOT NULL,source_id BIGINT NOT NULL,source_name TEXT NOT NULL,source_zabbix_hostid BIGINT,source_interface_itemid BIGINT,source_interface_name TEXT,source_interface_description TEXT,target_kind TEXT NOT NULL,target_id BIGINT NOT NULL,target_name TEXT NOT NULL,target_zabbix_hostid BIGINT,target_interface_itemid BIGINT,target_interface_name TEXT,target_interface_description TEXT,parent_link_id BIGINT REFERENCES links(id) ON DELETE SET NULL,geom geometry(LineString,4326) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS links_geom_gix ON links USING GIST(geom);CREATE INDEX IF NOT EXISTS nodes_geom_gix ON nodes USING GIST(geom);
 CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,username TEXT NOT NULL UNIQUE,display_name TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('superadmin','admin','technician','viewer')),password_salt TEXT NOT NULL,password_hash TEXT NOT NULL,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),remote_addr TEXT,user_agent TEXT);
+CREATE TABLE IF NOT EXISTS auth_attempts(attempt_key TEXT PRIMARY KEY,failures INTEGER NOT NULL DEFAULT 0,first_failed_at TIMESTAMPTZ NOT NULL DEFAULT now(),locked_until TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS issues(id BIGSERIAL PRIMARY KEY,target_kind TEXT NOT NULL CHECK(target_kind IN('device','node','link')),target_id BIGINT NOT NULL,target_name TEXT NOT NULL,severity TEXT NOT NULL CHECK(severity IN('medium','severe','disaster')),description TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN('pending','validated','resolved')),reported_by BIGINT NOT NULL REFERENCES users(id),validated_by BIGINT REFERENCES users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT now(),validated_at TIMESTAMPTZ,resolved_at TIMESTAMPTZ);CREATE INDEX IF NOT EXISTS issues_target_idx ON issues(target_kind,target_id,status);
 CREATE TABLE IF NOT EXISTS audit_log(id BIGSERIAL PRIMARY KEY,actor_id BIGINT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL,actor_role TEXT NOT NULL,action TEXT NOT NULL,target_kind TEXT NOT NULL,target_id BIGINT,target_name TEXT,details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT now());CREATE INDEX IF NOT EXISTS audit_log_created_idx ON audit_log(created_at DESC)""")
   q.execute("CREATE TABLE IF NOT EXISTS license_config(id SMALLINT PRIMARY KEY CHECK(id=1),license_key TEXT,valid BOOLEAN NOT NULL DEFAULT false,last_checked_at TIMESTAMPTZ,last_response JSONB NOT NULL DEFAULT '{}'::jsonb,updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
@@ -348,14 +358,31 @@ def zstates(ids):
 
 @app.post('/api/auth/login')
 def login(x:LoginIn,response:Response,request:Request):
+ key=f"{(request.client.host if request.client else 'unknown')}|{x.username.strip().lower()}"
  with pg() as c,c.cursor() as q:
+  q.execute('SELECT failures,locked_until FROM auth_attempts WHERE attempt_key=%s FOR UPDATE',(key,));attempt=q.fetchone()
+  if attempt and attempt['locked_until'] and attempt['locked_until']>datetime.now(timezone.utc):raise HTTPException(429,'Muitas tentativas. Tente novamente mais tarde.')
   q.execute('SELECT id,username,display_name,role,password_salt,password_hash,active FROM users WHERE lower(username)=lower(%s) FOR UPDATE',(x.username,));u=q.fetchone()
-  if not u or not u['active'] or not verify_password(x.password,u['password_salt'],u['password_hash']):raise HTTPException(401,'Usuário ou senha inválidos')
+  if not u or not u['active'] or not verify_password(x.password,u['password_salt'],u['password_hash']):
+   failures=(attempt['failures'] if attempt else 0)+1
+   locked=datetime.now(timezone.utc)+timedelta(minutes=LOGIN_LOCK_MINUTES) if failures>=LOGIN_MAX_FAILURES else None
+   q.execute('INSERT INTO auth_attempts(attempt_key,failures,locked_until)VALUES(%s,%s,%s) ON CONFLICT(attempt_key) DO UPDATE SET failures=EXCLUDED.failures,locked_until=EXCLUDED.locked_until',(key,failures,locked));raise HTTPException(401,'Usuário ou senha inválidos')
+  q.execute('DELETE FROM auth_attempts WHERE attempt_key=%s',(key,))
   token=secrets.token_urlsafe(48);q.execute('DELETE FROM sessions WHERE expires_at<=now()')
   if u['role']!='superadmin':q.execute('DELETE FROM sessions WHERE user_id=%s',(u['id'],))
-  q.execute('INSERT INTO sessions(token_hash,user_id,expires_at,remote_addr,user_agent)VALUES(%s,%s,%s,%s,%s)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],datetime.now(timezone.utc)+timedelta(hours=12),request.client.host if request.client else None,(request.headers.get('user-agent') or '')[:500]))
- response.set_cookie('netatlas_session',token,httponly=True,samesite='strict',secure=False,max_age=43200,path='/')
+  ttl=timedelta(days=VIEWER_SESSION_DAYS) if u['role']=='viewer' else timedelta(hours=SESSION_HOURS)
+  q.execute('INSERT INTO sessions(token_hash,user_id,expires_at,remote_addr,user_agent)VALUES(%s,%s,%s,%s,%s)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],datetime.now(timezone.utc)+ttl,request.client.host if request.client else None,(request.headers.get('user-agent') or '')[:500]))
+ response.set_cookie('netatlas_session',token,httponly=True,samesite='strict',secure=False,max_age=int(ttl.total_seconds()),path='/')
  return {k:u[k] for k in ('id','username','display_name','role')}
+@app.post('/api/auth/heartbeat')
+def heartbeat(request:Request,response:Response,u=Depends(viewer)):
+ token=request.cookies.get('netatlas_session')
+ if not token:raise HTTPException(401,'Sessão expirada')
+ if u['role']!='viewer':return {'ok':True}
+ expires=datetime.now(timezone.utc)+timedelta(days=VIEWER_SESSION_DAYS)
+ with pg() as c,c.cursor() as q:q.execute('UPDATE sessions SET expires_at=%s WHERE token_hash=%s',(expires,hashlib.sha256(token.encode()).hexdigest()))
+ response.set_cookie('netatlas_session',token,httponly=True,samesite='strict',secure=False,max_age=int(timedelta(days=VIEWER_SESSION_DAYS).total_seconds()),path='/')
+ return {'ok':True}
 @app.post('/api/auth/logout',status_code=204)
 def logout(request:Request,response:Response):
  token=request.cookies.get('netatlas_session')
