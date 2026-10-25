@@ -59,6 +59,7 @@ class DedicatedZabbixIn(BaseModel): hostid:int|None=None
 class RouteSuggestionIn(BaseModel):
  source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
 class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); password:str=Field(min_length=1,max_length=200)
+class PasswordChangeIn(BaseModel): current_password:str=Field(min_length=1,max_length=200); new_password:str=Field(min_length=8,max_length=200)
 class IssueIn(BaseModel):
  target_kind:str=Field(pattern='^(device|node|link)$'); target_id:int; target_name:str=Field(min_length=1,max_length=200); severity:str=Field(pattern='^(medium|severe|disaster)$'); description:str=Field(min_length=1,max_length=1000); latitude:float|None=Field(default=None,ge=-90,le=90); longitude:float|None=Field(default=None,ge=-180,le=180)
 class UserIn(BaseModel):
@@ -391,6 +392,14 @@ def logout(request:Request,response:Response):
  response.delete_cookie('netatlas_session',path='/')
 @app.get('/api/auth/me')
 def me(u=Depends(viewer)):return u
+@app.post('/api/auth/password')
+def change_password(x:PasswordChangeIn,u=Depends(viewer)):
+ with pg() as c,c.cursor() as q:
+  q.execute('SELECT password_salt,password_hash FROM users WHERE id=%s AND active FOR UPDATE',(u['id'],));current=q.fetchone()
+  if not current or not verify_password(x.current_password,current['password_salt'],current['password_hash']):raise HTTPException(401,'Senha atual inválida')
+  if x.current_password==x.new_password:raise HTTPException(422,'A nova senha deve ser diferente da atual')
+  salt,digest=password_hash(x.new_password);q.execute('UPDATE users SET password_salt=%s,password_hash=%s,updated_at=now() WHERE id=%s',(salt,digest,u['id']));q.execute('DELETE FROM sessions WHERE user_id=%s',(u['id'],))
+ return {'ok':True,'message':'Senha alterada. Faça login novamente.'}
 @app.get('/api/users')
 def users(u=Depends(user_manager)):
  with pg() as c,c.cursor() as q:
