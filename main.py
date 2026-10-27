@@ -819,6 +819,16 @@ def interfaces(host_id:int,u=Depends(viewer)):
   score,key=max(candidates,key=lambda x:x[0]);old=chosen.get((key,direction))
   if not old or score>old[0]:chosen[(key,direction)]=(score,int(r['itemid']))
  signal_ids=[v[1] for v in chosen.values()];signal_vals=latest_numeric(signal_ids)
+ error_sql="SELECT itemid,name,key_ FROM items WHERE hostid=%s AND status=0 AND flags<>2 AND (lower(name) REGEXP 'error|erro|discard|drop' OR lower(key_) REGEXP 'error|discard|drop')"
+ with closing(zconn()) as c,c.cursor() as q:q.execute(error_sql,(host_id,));error_rows=q.fetchall()
+ error_candidates={}
+ for r in error_rows:
+  text=f"{r['name']} {r['key_']}";nt=norm(text);candidates=[]
+  for key,g in groups.items():
+   ni=norm(g['name'])
+   if len(ni)>=4 and ni in nt:candidates.append((40-max(0,len(nt)-len(ni))/1000,key))
+  if candidates:error_candidates[max(candidates,key=lambda x:x[0])[1]]=int(r['itemid'])
+ error_vals=latest_numeric(list(error_candidates.values()))
  now=int(datetime.now(timezone.utc).timestamp())
  for key,g in groups.items():
   sv=vals.get(g['status_itemid']) if g['status_itemid'] else None
@@ -834,6 +844,7 @@ def interfaces(host_id:int,u=Depends(viewer)):
   rxid=chosen.get((key,'rx'),(None,None))[1];txid=chosen.get((key,'tx'),(None,None))[1];rx=signal_vals.get(rxid);tx=signal_vals.get(txid)
   g['optical_rx_dbm']=rx['value'] if rx else None;g['optical_rx_clock']=rx['clock'] if rx else None
   g['optical_tx_dbm']=tx['value'] if tx else None;g['optical_tx_clock']=tx['clock'] if tx else None
+  ev=error_vals.get(error_candidates.get(key));g['errors']=ev['value'] if ev else None;g['errors_clock']=ev['clock'] if ev else None
  def natural_interface_key(item):
   return [int(part) if part.isdigit() else part.lower() for part in re.split(r'(\d+)',item['name'])]
  return sorted(groups.values(),key=natural_interface_key)
