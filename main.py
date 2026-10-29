@@ -58,7 +58,9 @@ class ZabbixHostsImportIn(BaseModel):
 class ValidateProvisionalHostIn(BaseModel): hostid:int
 class DedicatedZabbixIn(BaseModel): hostid:int|None=None
 class RouteSuggestionIn(BaseModel):
- source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2); waypoints:list[list[float]]=Field(default_factory=list,max_length=8)
+ source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2); waypoints:list[list[float]]=Field(default_factory=list,max_length=60)
+class RouteItineraryIn(BaseModel):
+ coordinates:list[list[float]]=Field(min_length=2,max_length=5000)
 class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); password:str=Field(min_length=1,max_length=200)
 class PasswordChangeIn(BaseModel): current_password:str=Field(min_length=1,max_length=200); new_password:str=Field(min_length=8,max_length=200)
 class IssueIn(BaseModel):
@@ -802,6 +804,43 @@ def geocode_route_address(q:str,latitude:float|None=None,longitude:float|None=No
   except (KeyError,TypeError,ValueError):continue
   results.append({'name':item.get('display_name') or query,'latitude':lat,'longitude':lon,'type':item.get('type') or item.get('category')})
  return results
+
+@app.post('/api/routes/itinerary')
+def route_itinerary(x:RouteItineraryIn,u=Depends(operator)):
+ valid(x.coordinates)
+ limit=90
+ if len(x.coordinates)<=limit:points=x.coordinates
+ else:
+  last=len(x.coordinates)-1
+  indexes=sorted(set(round(last*index/(limit-1)) for index in range(limit)))
+  points=[x.coordinates[index] for index in indexes]
+ encoded=';'.join(f'{point[0]},{point[1]}' for point in points)
+ try:
+  params={'steps':'true','overview':'false','geometries':'geojson','gaps':'ignore','tidy':'true','radiuses':';'.join('100' for _ in points)}
+  with httpx.Client(timeout=25) as client:
+   response=client.get(f'{OSRM_URL}/match/v1/driving/{encoded}',params=params);data=response.json()
+   containers=data.get('matchings') or [] if data.get('code')=='Ok' else []
+   if not containers:
+    route_limit=24;last=len(x.coordinates)-1;route_count=min(route_limit,len(x.coordinates))
+    route_indexes=sorted(set(round(last*index/(route_count-1)) for index in range(route_count)))
+    route_points=[x.coordinates[index] for index in route_indexes]
+    route_encoded=';'.join(f'{point[0]},{point[1]}' for point in route_points)
+    response=client.get(f'{OSRM_URL}/route/v1/driving/{route_encoded}',params={'steps':'true','overview':'false','geometries':'geojson'});response.raise_for_status();data=response.json()
+    containers=data.get('routes') or [] if data.get('code')=='Ok' else []
+ except Exception as error:raise HTTPException(502,f'Não foi possível identificar as ruas do roteiro: {error}')
+ if not containers:raise HTTPException(422,'Não foi possível associar este enlace às ruas do mapa')
+ streets=[]
+ for container in containers:
+  for leg in container.get('legs') or []:
+   for step in leg.get('steps') or []:
+    name=(step.get('name') or step.get('ref') or '').strip()
+    location=(step.get('maneuver') or {}).get('location')
+    if not name or not location or len(location)!=2:continue
+    key=unicodedata.normalize('NFKD',name).encode('ascii','ignore').decode().casefold()
+    if streets and streets[-1]['key']==key:continue
+    streets.append({'key':key,'name':name,'longitude':float(location[0]),'latitude':float(location[1])})
+ streets=streets[:60]
+ return {'streets':[{key:value for key,value in street.items() if key!='key'} for street in streets],'provider':'OSRM / OpenStreetMap'}
 
 @app.get('/api/interfaces/{host_id}')
 def interfaces(host_id:int,u=Depends(viewer)):
