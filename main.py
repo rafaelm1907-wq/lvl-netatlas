@@ -17,6 +17,7 @@ async def unhandled_error(request:Request,exc:Exception):
 app.mount("/static",StaticFiles(directory="/opt/netatlas/static"),name="static")
 NETBOX_URL=os.getenv("NETBOX_URL","").rstrip("/"); NETBOX_TOKEN=os.getenv("NETBOX_TOKEN","")
 OSRM_URL=os.getenv("OSRM_URL","https://router.project-osrm.org").rstrip("/")
+NOMINATIM_URL=os.getenv("NOMINATIM_URL","https://nominatim.openstreetmap.org").rstrip("/")
 ZHOST=os.getenv("ZABBIX_DB_HOST",""); ZPORT=int(os.getenv("ZABBIX_DB_PORT","3306")); ZNAME=os.getenv("ZABBIX_DB_NAME","zabbix"); ZUSER=os.getenv("ZABBIX_DB_USER",""); ZPASS=os.getenv("ZABBIX_DB_PASSWORD",""); ZREAD_TIMEOUT=int(os.getenv("ZABBIX_DB_READ_TIMEOUT","60"))
 DB_DSN=os.getenv("NETATLAS_DB_DSN","postgresql://netatlas_app@127.0.0.1/netatlas")
 LICENSE_SERVER_URL=os.getenv("LICENSE_SERVER_URL","https://lvllicencas.lvltech.com.br").rstrip('/')
@@ -57,7 +58,7 @@ class ZabbixHostsImportIn(BaseModel):
 class ValidateProvisionalHostIn(BaseModel): hostid:int
 class DedicatedZabbixIn(BaseModel): hostid:int|None=None
 class RouteSuggestionIn(BaseModel):
- source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2)
+ source:list[float]=Field(min_length=2,max_length=2); target:list[float]=Field(min_length=2,max_length=2); waypoints:list[list[float]]=Field(default_factory=list,max_length=8)
 class LoginIn(BaseModel): username:str=Field(min_length=1,max_length=80); password:str=Field(min_length=1,max_length=200)
 class PasswordChangeIn(BaseModel): current_password:str=Field(min_length=1,max_length=200); new_password:str=Field(min_length=8,max_length=200)
 class IssueIn(BaseModel):
@@ -770,9 +771,10 @@ def validate_provisional_host(node_id:int,x:ValidateProvisionalHostIn,u=Depends(
 
 @app.post('/api/routes/suggest')
 def suggest_route(x:RouteSuggestionIn,u=Depends(operator)):
- valid([x.source,x.target]);a,b=x.source,x.target
+ points=[x.source,*x.waypoints,x.target];valid(points)
  try:
-  with httpx.Client(timeout=20) as c:r=c.get(f'{OSRM_URL}/route/v1/driving/{a[0]},{a[1]};{b[0]},{b[1]}',params={'geometries':'geojson','overview':'full','steps':'false'})
+  route_points=';'.join(f'{point[0]},{point[1]}' for point in points)
+  with httpx.Client(timeout=20) as c:r=c.get(f'{OSRM_URL}/route/v1/driving/{route_points}',params={'geometries':'geojson','overview':'full','steps':'false'})
   r.raise_for_status();data=r.json()
  except Exception as e:raise HTTPException(502,f'Não foi possível consultar o serviço de rotas: {e}')
  if data.get('code')!='Ok' or not data.get('routes'):raise HTTPException(422,'Não foi encontrado um trajeto pelas ruas entre estes equipamentos')
@@ -780,6 +782,26 @@ def suggest_route(x:RouteSuggestionIn,u=Depends(operator)):
  if len(coordinates)<2:raise HTTPException(502,'O serviço de rotas retornou uma geometria inválida')
  coordinates[0]=x.source;coordinates[-1]=x.target
  return {'coordinates':coordinates,'distance_m':data['routes'][0].get('distance'),'duration_s':data['routes'][0].get('duration'),'provider':'OSRM / OpenStreetMap'}
+
+@app.get('/api/routes/geocode')
+def geocode_route_address(q:str,latitude:float|None=None,longitude:float|None=None,u=Depends(operator)):
+ query=q.strip()
+ if len(query)<3:raise HTTPException(422,'Digite pelo menos 3 caracteres para pesquisar a rua')
+ params={'q':query,'format':'jsonv2','addressdetails':'1','limit':'6','countrycodes':'br'}
+ if latitude is not None and longitude is not None:
+  if not -90<=latitude<=90 or not -180<=longitude<=180:raise HTTPException(422,'Coordenadas de referência inválidas')
+  delta=.18;params['viewbox']=f'{longitude-delta},{latitude+delta},{longitude+delta},{latitude-delta}'
+ try:
+  headers={'User-Agent':'LVL-NetAtlas/0.2 (route editor)'}
+  with httpx.Client(timeout=15,headers=headers) as client:response=client.get(f'{NOMINATIM_URL}/search',params=params)
+  response.raise_for_status();items=response.json()
+ except Exception as error:raise HTTPException(502,f'Não foi possível pesquisar o endereço: {error}')
+ results=[]
+ for item in items:
+  try:lat=float(item['lat']);lon=float(item['lon'])
+  except (KeyError,TypeError,ValueError):continue
+  results.append({'name':item.get('display_name') or query,'latitude':lat,'longitude':lon,'type':item.get('type') or item.get('category')})
+ return results
 
 @app.get('/api/interfaces/{host_id}')
 def interfaces(host_id:int,u=Depends(viewer)):
